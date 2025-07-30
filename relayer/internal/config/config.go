@@ -24,9 +24,10 @@ type ServerConfig struct {
 }
 
 type EthereumConfig struct {
-	RPCURL     string `json:"rpc_url"`
-	PrivateKey string `json:"private_key"`
-	ChainID    int64  `json:"chain_id"`
+	RPCURL       string `json:"rpc_url"`
+	PrivateKey   string `json:"private_key"`
+	ChainID      int64  `json:"chain_id"`
+	ContractAddr string `json:"contract_addr"`
 }
 
 type CosmosConfig struct {

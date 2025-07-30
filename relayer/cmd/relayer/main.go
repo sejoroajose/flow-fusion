@@ -1,5 +1,3 @@
-// relayer/cmd/relayer/main.go
-
 package main
 
 import (

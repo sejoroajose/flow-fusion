@@ -4,8 +4,9 @@ import (
 	"errors"
 	"math/big"
 	"strings"
+	"fmt"
 
-	ethereum "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -106,7 +107,11 @@ func NewFlowFusionEscrowFactory(address common.Address, backend bind.ContractBac
 	if err != nil {
 		return nil, err
 	}
-	return &FlowFusionEscrowFactory{FlowFusionEscrowFactoryCaller: FlowFusionEscrowFactoryCaller{contract: contract}, FlowFusionEscrowFactoryTransactor: FlowFusionEscrowFactoryTransactor{contract: contract}, FlowFusionEscrowFactoryFilterer: FlowFusionEscrowFactoryFilterer{contract: contract}}, nil
+	return &FlowFusionEscrowFactory{
+		FlowFusionEscrowFactoryCaller:     FlowFusionEscrowFactoryCaller{contract: contract},
+		FlowFusionEscrowFactoryTransactor: FlowFusionEscrowFactoryTransactor{contract: contract},
+		FlowFusionEscrowFactoryFilterer:   FlowFusionEscrowFactoryFilterer{contract: contract},
+	}, nil
 }
 
 // bindFlowFusionEscrowFactory binds a generic wrapper to an already deployed contract.
@@ -189,6 +194,16 @@ func (_FlowFusionEscrowFactory *FlowFusionEscrowFactoryTransactor) AddResolver(o
 	return _FlowFusionEscrowFactory.contract.Transact(opts, "addResolver", resolver)
 }
 
+// Get escrow factory address
+func (_FlowFusionEscrowFactory *FlowFusionEscrowFactoryCaller) EscrowFactory(opts *bind.CallOpts) (common.Address, error) {
+	var out []interface{}
+	err := _FlowFusionEscrowFactory.contract.Call(opts, &out, "escrowFactory")
+	if err != nil {
+		return common.Address{}, err
+	}
+	return *abi.ConvertType(out[0], new(common.Address)).(*common.Address), nil
+}
+
 // Event filtering structures
 type FlowFusionEscrowFactoryTWAPOrderCreated struct {
 	OrderId         [32]byte
@@ -238,16 +253,27 @@ func (_FlowFusionEscrowFactory *FlowFusionEscrowFactoryFilterer) FilterTWAPOrder
 	return &FlowFusionEscrowFactoryTWAPOrderCreatedIterator{contract: _FlowFusionEscrowFactory.contract, event: "TWAPOrderCreated", logs: logs, sub: sub}, nil
 }
 
+func (_FlowFusionEscrowFactory *FlowFusionEscrowFactoryFilterer) FilterCosmosEscrowCreated(opts *bind.FilterOpts, orderId [][32]byte) (*FlowFusionEscrowFactoryCosmosEscrowCreatedIterator, error) {
+	var orderIdRule []interface{}
+	for _, orderIdItem := range orderId {
+		orderIdRule = append(orderIdRule, orderIdItem)
+	}
+
+	logs, sub, err := _FlowFusionEscrowFactory.contract.FilterLogs(opts, "CosmosEscrowCreated", orderIdRule)
+	if err != nil {
+		return nil, err
+	}
+	return &FlowFusionEscrowFactoryCosmosEscrowCreatedIterator{contract: _FlowFusionEscrowFactory.contract, event: "CosmosEscrowCreated", logs: logs, sub: sub}, nil
+}
+
 type FlowFusionEscrowFactoryTWAPOrderCreatedIterator struct {
-	Event *FlowFusionEscrowFactoryTWAPOrderCreated
-	
+	Event    *FlowFusionEscrowFactoryTWAPOrderCreated
 	contract *bind.BoundContract
 	event    string
-	
-	logs chan types.Log
-	sub  ethereum.Subscription
-	done bool
-	fail error
+	logs     chan types.Log
+	sub      ethereum.Subscription
+	done     bool
+	fail     error
 }
 
 func (it *FlowFusionEscrowFactoryTWAPOrderCreatedIterator) Next() bool {
@@ -264,7 +290,6 @@ func (it *FlowFusionEscrowFactoryTWAPOrderCreatedIterator) Next() bool {
 			}
 			it.Event.Raw = log
 			return true
-
 		default:
 			return false
 		}
@@ -278,7 +303,6 @@ func (it *FlowFusionEscrowFactoryTWAPOrderCreatedIterator) Next() bool {
 		}
 		it.Event.Raw = log
 		return true
-
 	case err := <-it.sub.Err():
 		it.done = true
 		it.fail = err
@@ -293,4 +317,164 @@ func (it *FlowFusionEscrowFactoryTWAPOrderCreatedIterator) Error() error {
 func (it *FlowFusionEscrowFactoryTWAPOrderCreatedIterator) Close() error {
 	it.sub.Unsubscribe()
 	return nil
+}
+
+type FlowFusionEscrowFactoryCosmosEscrowCreatedIterator struct {
+	Event    *FlowFusionEscrowFactoryCosmosEscrowCreated
+	contract *bind.BoundContract
+	event    string
+	logs     chan types.Log
+	sub      ethereum.Subscription
+	done     bool
+	fail     error
+}
+
+func (it *FlowFusionEscrowFactoryCosmosEscrowCreatedIterator) Next() bool {
+	if it.fail != nil {
+		return false
+	}
+	if it.done {
+		select {
+		case log := <-it.logs:
+			it.Event = new(FlowFusionEscrowFactoryCosmosEscrowCreated)
+			if err := it.contract.UnpackLog(it.Event, it.event, log); err != nil {
+				it.fail = err
+				return false
+			}
+			it.Event.Raw = log
+			return true
+		default:
+			return false
+		}
+	}
+	select {
+	case log := <-it.logs:
+		it.Event = new(FlowFusionEscrowFactoryCosmosEscrowCreated)
+		if err := it.contract.UnpackLog(it.Event, it.event, log); err != nil {
+			it.fail = err
+			return false
+		}
+		it.Event.Raw = log
+		return true
+	case err := <-it.sub.Err():
+		it.done = true
+		it.fail = err
+		return it.Next()
+	}
+}
+
+func (it *FlowFusionEscrowFactoryCosmosEscrowCreatedIterator) Error() error {
+	return it.fail
+}
+
+func (it *FlowFusionEscrowFactoryCosmosEscrowCreatedIterator) Close() error {
+	it.sub.Unsubscribe()
+	return nil
+}
+
+// IEscrowFactoryABI is the ABI for the IEscrowFactory interface
+var IEscrowFactoryABI = `[
+	{
+		"inputs": [
+			{
+				"components": [
+					{"internalType": "bytes32", "name": "orderHash", "type": "bytes32"},
+					{"internalType": "bytes32", "name": "hashLock", "type": "bytes32"},
+					{"internalType": "address", "name": "maker", "type": "address"},
+					{"internalType": "address", "name": "taker", "type": "address"},
+					{"internalType": "address", "name": "token", "type": "address"},
+					{"internalType": "uint256", "name": "amount", "type": "uint256"},
+					{"internalType": "uint256", "name": "safetyDeposit", "type": "uint256"},
+					{
+						"components": [
+							{"internalType": "uint256", "name": "prepayment", "type": "uint256"},
+							{"internalType": "uint256", "name": "maturity", "type": "uint256"},
+							{"internalType": "uint256", "name": "expiration", "type": "uint256"}
+						],
+						"name": "timelocks", "type": "tuple"
+					}
+				],
+				"internalType": "struct IBaseEscrow.Immutables", "name": "immutables", "type": "tuple"
+			},
+			{"internalType": "uint256", "name": "timestamp", "type": "uint256"}
+		],
+		"name": "createSrcEscrow",
+		"outputs": [],
+		"stateMutability": "payable",
+		"type": "function"
+	},
+	{
+		"inputs": [
+			{"internalType": "bytes32", "name": "orderHash", "type": "bytes32"}
+		],
+		"name": "escrows",
+		"outputs": [
+			{"internalType": "address", "name": "", "type": "address"}
+		],
+		"stateMutability": "view",
+		"type": "function"
+	}
+]`
+
+// IEscrowFactory is a Go binding for the IEscrowFactory contract
+type IEscrowFactory struct {
+	contract *bind.BoundContract
+}
+
+// NewIEscrowFactory creates a new instance of IEscrowFactory, bound to a specific deployed contract
+func NewIEscrowFactory(address common.Address, backend bind.ContractBackend) (*IEscrowFactory, error) {
+	parsed, err := abi.JSON(strings.NewReader(IEscrowFactoryABI))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse IEscrowFactory ABI: %w", err)
+	}
+	contract := bind.NewBoundContract(address, parsed, backend, backend, backend)
+	return &IEscrowFactory{contract: contract}, nil
+}
+
+// CreateSrcEscrow calls the createSrcEscrow function on the IEscrowFactory contract
+func (f *IEscrowFactory) CreateSrcEscrow(opts *bind.TransactOpts, immutables IBaseEscrowImmutables, timestamp *big.Int) (*types.Transaction, error) {
+	return f.contract.Transact(opts, "createSrcEscrow", immutables, timestamp)
+}
+
+// Escrows retrieves the escrow contract address for a given orderHash
+func (f *IEscrowFactory) Escrows(opts *bind.CallOpts, orderHash [32]byte) (common.Address, error) {
+	var out []interface{}
+	err := f.contract.Call(opts, &out, "escrows", orderHash)
+	if err != nil {
+		return common.Address{}, err
+	}
+	return *abi.ConvertType(out[0], new(common.Address)).(*common.Address), nil
+}
+
+// IBaseEscrowABI is the assumed ABI for the IBaseEscrow interface
+var IBaseEscrowABI = `[
+	{
+		"inputs": [
+			{"internalType": "bytes32", "name": "secret", "type": "bytes32"}
+		],
+		"name": "revealSecret",
+		"outputs": [],
+		"stateMutability": "nonpayable",
+		"type": "function"
+	}
+]`
+
+// IBaseEscrow is a Go binding for the IBaseEscrow contract
+type IBaseEscrow struct {
+	contract *bind.BoundContract
+}
+
+// NewIBaseEscrow creates a new instance of IBaseEscrow, bound to a specific deployed contract
+func NewIBaseEscrow(address common.Address, backend bind.ContractBackend) (*IBaseEscrow, error) {
+	parsed, err := abi.JSON(strings.NewReader(IBaseEscrowABI))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse IBaseEscrow ABI: %w", err)
+	}
+	contract := bind.NewBoundContract(address, parsed, backend, backend, backend)
+	return &IBaseEscrow{contract: contract}, nil
+}
+
+// RevealSecret calls the revealSecret function on the IBaseEscrow contract
+func (e *IBaseEscrow) RevealSecret(opts *bind.TransactOpts, secret [32]byte) (*types.Transaction, error) {
+	return e.contract.Transact(opts, "revealSecret", secret)
 }

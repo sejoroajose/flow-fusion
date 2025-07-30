@@ -909,80 +909,101 @@ func (cb *CircuitBreaker) RecordSuccess() {
 
 // OneInch client methods
 func (c *OneInchClient) GetQuote(ctx context.Context, chainID, src, dst, amount string) (*OneInchQuoteResponse, error) {
-	if err := c.rateLimiter.Wait(ctx); err != nil {
-		return nil, err
-	}
+    if err := c.rateLimiter.Wait(ctx); err != nil {
+        return nil, err
+    }
 
-	endpoint := fmt.Sprintf("%s%s/%s/quote", OneInchAPIBaseURL, OneInchQuoteAPI, chainID)
-	
-	params := url.Values{}
-	params.Set("src", src)
-	params.Set("dst", dst)
-	params.Set("amount", amount)
-	
-	return c.makeRequest[OneInchQuoteResponse](ctx, "GET", endpoint+"?"+params.Encode(), nil)
+    endpoint := fmt.Sprintf("%s%s/%s/quote", OneInchAPIBaseURL, OneInchQuoteAPI, chainID)
+    
+    params := url.Values{}
+    params.Set("src", src)
+    params.Set("dst", dst)
+    params.Set("amount", amount)
+    
+    bodyBytes, err := c.makeRequest(ctx, "GET", endpoint+"?"+params.Encode(), nil)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get quote: %w", err)
+    }
+
+    var quote OneInchQuoteResponse
+    if err := json.Unmarshal(bodyBytes, &quote); err != nil {
+        return nil, fmt.Errorf("failed to decode quote response: %w", err)
+    }
+
+    return &quote, nil
 }
 
 func (c *OneInchClient) GetSwap(ctx context.Context, chainID, src, dst, amount, from string, slippage float64) (*OneInchSwapResponse, error) {
-	if err := c.rateLimiter.Wait(ctx); err != nil {
-		return nil, err
-	}
+    if err := c.rateLimiter.Wait(ctx); err != nil {
+        return nil, err
+    }
 
-	endpoint := fmt.Sprintf("%s%s/%s/swap", OneInchAPIBaseURL, OneInchSwapAPI, chainID)
-	
-	params := url.Values{}
-	params.Set("src", src)
-	params.Set("dst", dst)
-	params.Set("amount", amount)
-	params.Set("from", from)
-	params.Set("slippage", strconv.FormatFloat(slippage, 'f', 2, 64))
-	
-	return c.makeRequest[OneInchSwapResponse](ctx, "GET", endpoint+"?"+params.Encode(), nil)
+    endpoint := fmt.Sprintf("%s%s/%s/swap", OneInchAPIBaseURL, OneInchSwapAPI, chainID)
+    
+    params := url.Values{}
+    params.Set("src", src)
+    params.Set("dst", dst)
+    params.Set("amount", amount)
+    params.Set("from", from)
+    params.Set("slippage", strconv.FormatFloat(slippage, 'f', 2, 64))
+    
+    bodyBytes, err := c.makeRequest(ctx, "GET", endpoint+"?"+params.Encode(), nil)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get swap: %w", err)
+    }
+
+    var swap OneInchSwapResponse
+    if err := json.Unmarshal(bodyBytes, &swap); err != nil {
+        return nil, fmt.Errorf("failed to decode swap response: %w", err)
+    }
+
+    return &swap, nil
 }
 
-func (c *OneInchClient) makeRequest[T any](ctx context.Context, method, url string, body io.Reader) (*T, error) {
-	var lastErr error
-	for i := 0; i < MaxRetries; i++ {
-		req, err := http.NewRequestWithContext(ctx, method, url, body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
 
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "FlowFusion/1.0")
+func (c *OneInchClient) makeRequest(ctx context.Context, method, url string, body io.Reader) ([]byte, error) {
+    var lastErr error
+    for i := 0; i < MaxRetries; i++ {
+        req, err := http.NewRequestWithContext(ctx, method, url, body)
+        if err != nil {
+            return nil, fmt.Errorf("failed to create request: %w", err)
+        }
 
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("request failed: %w", err)
-			if i < MaxRetries-1 {
-				time.Sleep(RetryDelay)
-			}
-			continue
-		}
-		defer resp.Body.Close()
+        req.Header.Set("Authorization", "Bearer "+c.apiKey)
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("User-Agent", "FlowFusion/1.0")
 
-		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-			if i < MaxRetries-1 {
-				time.Sleep(RetryDelay)
-			}
-			continue
-		}
+        resp, err := c.httpClient.Do(req)
+        if err != nil {
+            lastErr = fmt.Errorf("request failed: %w", err)
+            if i < MaxRetries-1 {
+                time.Sleep(RetryDelay)
+            }
+            continue
+        }
+        defer resp.Body.Close()
 
-		var result T
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode response: %w", err)
-			if i < MaxRetries-1 {
-				time.Sleep(RetryDelay)
-			}
-			continue
-		}
+        if resp.StatusCode != http.StatusOK {
+            bodyBytes, _ := io.ReadAll(resp.Body)
+            lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+            if i < MaxRetries-1 {
+                time.Sleep(RetryDelay)
+            }
+            continue
+        }
 
-		return &result, nil
-	}
-	return nil, fmt.Errorf("failed after %d retries: %w", MaxRetries, lastErr)
+        bodyBytes, err := io.ReadAll(resp.Body)
+        if err != nil {
+            lastErr = fmt.Errorf("failed to read response body: %w", err)
+            if i < MaxRetries-1 {
+                time.Sleep(RetryDelay)
+            }
+            continue
+        }
+
+        return bodyBytes, nil
+    }
+    return nil, fmt.Errorf("failed after %d retries: %w", MaxRetries, lastErr)
 }
 
 // createEthereumEscrow creates an Ethereum escrow transaction
@@ -1110,7 +1131,7 @@ func (e *Engine) executeSwap(ctx context.Context, order *TWAPOrder, window *Exec
 	gasPrice, _ := new(big.Int).SetString(swapData.Tx.GasPrice, 10)
 
 	tx := types.NewTransaction(
-		0, // Nonce will be set by ethClient
+		0, 
 		common.HexToAddress(swapData.Tx.To),
 		value,
 		uint64(swapData.Tx.Gas),

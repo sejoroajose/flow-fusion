@@ -4,11 +4,12 @@ pragma solidity 0.8.30;
 import {Ownable} from "./@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "./@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "./@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "./@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import {ReentrancyGuard} from "./@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IEscrowFactory} from "../lib/cross-chain-swap/contracts/interfaces/IEscrowFactory.sol";
 import {IBaseEscrow} from "../lib/cross-chain-swap/contracts/interfaces/IBaseEscrow.sol";
 import {TimelocksLib, Timelocks} from "../lib/cross-chain-swap/contracts/libraries/TimelocksLib.sol";
+import {AddressLib} from "../solidity-utils/contracts/libraries/AddressLib.sol";
 
 /**
  * @title FlowFusionEscrowFactory
@@ -144,8 +145,8 @@ contract FlowFusionEscrowFactory is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Execute a TWAP interval (called by authorized resolver)
-     */
+    * @notice Execute a TWAP interval (called by authorized resolver)
+    */
     function executeTWAPInterval(
         bytes32 orderId,
         uint256 intervalIndex,
@@ -154,7 +155,7 @@ contract FlowFusionEscrowFactory is Ownable, ReentrancyGuard {
     ) external payable nonReentrant {
         require(secretHash != bytes32(0), "Invalid secret hash");
         require(immutables.amount > 0, "Invalid escrow amount");
-        require(immutables.maker != address(0), "Invalid maker address");
+        require(AddressLib.get(immutables.maker) != address(0), "Invalid maker address");
 
         // Check authorization
         if (!authorizedResolvers[msg.sender]) {
@@ -163,8 +164,7 @@ contract FlowFusionEscrowFactory is Ownable, ReentrancyGuard {
 
         TWAPOrder storage order = twapOrders[orderId];
         
-        // Validate order
-        if (order.maker == address(0)) {
+        if (address(order.maker) == address(0)) {
             revert OrderNotFound();
         }
         if (order.cancelled) {
@@ -185,11 +185,17 @@ contract FlowFusionEscrowFactory is Ownable, ReentrancyGuard {
             intervalAmount = order.config.totalAmount - order.totalExecuted;
         }
 
-        // Create escrow for this interval
-        IBaseEscrow.Immutables memory intervalImmutables = immutables;
-        intervalImmutables.amount = intervalAmount;
-        intervalImmutables.hashLock = secretHash;
-        intervalImmutables.maker = order.maker;
+        // Create escrow for this interval - Fix: Use correct field names and type conversions
+        IBaseEscrow.Immutables memory intervalImmutables = IBaseEscrow.Immutables({
+            orderHash: immutables.orderHash,
+            hashlock: secretHash,
+            maker: Address.wrap(uint256(uint160(order.maker))),
+            taker: immutables.taker,
+            token: immutables.token,
+            amount: intervalAmount,
+            safetyDeposit: immutables.safetyDeposit,
+            timelocks: immutables.timelocks
+        });
 
         // Transfer tokens to escrow
         IERC20(order.token).safeTransfer(address(escrowFactory), intervalAmount);
@@ -207,6 +213,7 @@ contract FlowFusionEscrowFactory is Ownable, ReentrancyGuard {
     }
 
     event TWAPOrderCancelled(bytes32 indexed orderId, address indexed maker, uint256 refundedAmount);
+    
     /**
      * @notice Cancel a TWAP order (only maker can cancel)
      */
