@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	vault "github.com/hashicorp/vault/api"
 )
 
 type Config struct {
@@ -54,15 +56,32 @@ type DatabaseConfig struct {
 }
 
 func Load() (*Config, error) {
+
+	vaultClient, err := vault.NewClient(&vault.Config{
+        Address: os.Getenv("VAULT_ADDR"),
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to initialize Vault client: %w", err)
+    }
+
+    secret, err := vaultClient.Logical().Read("secret/data/relayer")
+    if err != nil {
+        return nil, fmt.Errorf("failed to read from Vault: %w", err)
+    }
+
+    ethPrivateKey := secret.Data["ethereum_private_key"].(string)
+    oneInchAPIKey := secret.Data["oneinch_api_key"].(string)
+	
 	config := &Config{
 		Server: ServerConfig{
 			Port: getEnvInt("RELAYER_PORT", 8080),
 		},
 		Ethereum: EthereumConfig{
-			RPCURL:     getEnvString("ETHEREUM_RPC", "http://localhost:8545"),
-			PrivateKey: getEnvString("RELAYER_PRIVATE_KEY", ""),
-			ChainID:    int64(getEnvInt("ETHEREUM_CHAIN_ID", 1)),
-		},
+            RPCURL:     getEnvString("ETHEREUM_RPC", "http://localhost:8545"),
+            PrivateKey: ethPrivateKey,
+            ChainID:    int64(getEnvInt("ETHEREUM_CHAIN_ID", 1)),
+            ContractAddr: getEnvString("ETHEREUM_CONTRACT_ADDR", ""),
+        },
 		Cosmos: CosmosConfig{
 			RPCURL:   getEnvString("COSMOS_RPC", "http://localhost:26657"),
 			GRPCAddr: getEnvString("COSMOS_GRPC", "localhost:9090"),
@@ -71,8 +90,8 @@ func Load() (*Config, error) {
 			Denom:    getEnvString("COSMOS_DENOM", "uatom"),
 		},
 		OneInch: OneInchConfig{
-			APIKey: getEnvString("ONEINCH_API_KEY", ""),
-		},
+            APIKey: oneInchAPIKey,
+        },
 		TWAP: TWAPConfig{
 			MaxIntervals:    getEnvInt("TWAP_MAX_INTERVALS", 100),
 			MinIntervalTime: time.Duration(getEnvInt("TWAP_MIN_INTERVAL_SECONDS", 60)) * time.Second,

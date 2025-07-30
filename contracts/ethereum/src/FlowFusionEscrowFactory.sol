@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {Ownable} from "./@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "./@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "./@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "./@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 import {IEscrowFactory} from "../lib/cross-chain-swap/contracts/interfaces/IEscrowFactory.sol";
 import {IBaseEscrow} from "../lib/cross-chain-swap/contracts/interfaces/IBaseEscrow.sol";
@@ -14,7 +15,7 @@ import {TimelocksLib, Timelocks} from "../lib/cross-chain-swap/contracts/librari
  * @dev Enhanced escrow factory for Cosmos bridge with TWAP support
  * @custom:security-contact security@flow-fusion.com
  */
-contract FlowFusionEscrowFactory is Ownable {
+contract FlowFusionEscrowFactory is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using TimelocksLib for Timelocks;
 
@@ -96,6 +97,14 @@ contract FlowFusionEscrowFactory is Ownable {
         TWAPConfig calldata config,
         string calldata cosmosRecipient
     ) external payable {
+        require(token != address(0), "Invalid token address");
+        require(bytes(cosmosRecipient).length >= 10 && bytes(cosmosRecipient).length <= 64, "Invalid Cosmos recipient");
+        require(config.totalAmount > 0, "Invalid amount");
+        require(config.intervalCount > 0 && config.intervalCount <= MAX_INTERVALS, "Invalid interval count");
+        require(config.timeWindow / config.intervalCount >= MIN_INTERVAL_DURATION, "Invalid interval duration");
+        require(config.maxSlippage <= MAX_SLIPPAGE, "Invalid slippage");
+        require(config.startTime >= block.timestamp, "Invalid start time");
+
         // Validate TWAP configuration
         if (
             config.totalAmount == 0 ||
@@ -142,7 +151,11 @@ contract FlowFusionEscrowFactory is Ownable {
         uint256 intervalIndex,
         bytes32 secretHash,
         IBaseEscrow.Immutables calldata immutables
-    ) external payable {
+    ) external payable nonReentrant {
+        require(secretHash != bytes32(0), "Invalid secret hash");
+        require(immutables.amount > 0, "Invalid escrow amount");
+        require(immutables.maker != address(0), "Invalid maker address");
+
         // Check authorization
         if (!authorizedResolvers[msg.sender]) {
             revert UnauthorizedResolver();
@@ -193,25 +206,21 @@ contract FlowFusionEscrowFactory is Ownable {
         emit CosmosEscrowCreated(orderId, intervalImmutables, order.cosmosRecipient);
     }
 
+    event TWAPOrderCancelled(bytes32 indexed orderId, address indexed maker, uint256 refundedAmount);
     /**
      * @notice Cancel a TWAP order (only maker can cancel)
      */
-    function cancelTWAPOrder(bytes32 orderId) external {
+    function cancelTWAPOrder(bytes32 orderId) external nonReentrant {
         TWAPOrder storage order = twapOrders[orderId];
         
-        if (order.maker != msg.sender) {
-            revert UnauthorizedResolver();
-        }
-        if (order.cancelled) {
-            revert OrderCancelled();
-        }
+        require(order.maker == msg.sender, "Unauthorized");
+        require(!order.cancelled, "Order already cancelled");
 
         order.cancelled = true;
-        
-        // Refund remaining tokens
         uint256 remainingAmount = order.config.totalAmount - order.totalExecuted;
         if (remainingAmount > 0) {
             IERC20(order.token).safeTransfer(order.maker, remainingAmount);
+            emit TWAPOrderCancelled(orderId, order.maker, remainingAmount);
         }
     }
 

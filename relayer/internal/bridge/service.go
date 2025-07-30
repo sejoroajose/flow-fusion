@@ -313,11 +313,30 @@ func (s *Service) GetCosmosStatus(c *gin.Context) {
 }
 
 func (s *Service) HandleWebSocket(c *gin.Context) {
-	conn, err := s.wsUpgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		s.logger.Error("Failed to upgrade WebSocket", zap.Error(err))
-		return
-	}
+	wsUpgrader := websocket.Upgrader{
+        CheckOrigin: func(r *http.Request) bool {
+            allowedOrigins := []string{"https://flow-fusion.com", "https://api.flow-fusion.com"}
+            origin := r.Header.Get("Origin")
+            for _, allowed := range allowedOrigins {
+                if origin == allowed {
+                    return true
+                }
+            }
+            return false
+        },
+    }
+
+	conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
+    if err != nil {
+        s.logger.Error("Failed to upgrade WebSocket", zap.Error(err))
+        return
+    }
+
+	token := c.Query("token")
+    if !s.validateWebSocketToken(token) {
+        conn.Close()
+        return
+    }
 
 	defer conn.Close()
 
@@ -342,7 +361,10 @@ func (s *Service) HandleWebSocket(c *gin.Context) {
 	}
 }
 
-// Private methods
+func (s *Service) validateWebSocketToken(token string) bool {
+    // Implement JWT or other token validation
+    return true // Replace with actual validation logic
+}
 
 func (s *Service) calculateQuote(req BridgeQuoteRequest, amount *big.Int) (*BridgeQuoteResponse, error) {
 	// For demo purposes, return mock quote
