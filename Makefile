@@ -25,7 +25,7 @@ setup-env:
 
 setup-deps:
 	@echo "📦 Installing dependencies..."
-	@npm install
+	@yarn install
 	@echo "✅ Dependencies installed"
 
 # =============================================================================
