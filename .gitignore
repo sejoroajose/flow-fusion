@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+target/
+dist/
+cache/
+
+# Build outputs
+contracts/ethereum/out/
+contracts/ethereum/cache/
+contracts/cosmos/target/
+relayer/bin/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+
+# Go specific
+vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# Rust specific
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Foundry specific
+broadcast/
+.forge-snapshots/
