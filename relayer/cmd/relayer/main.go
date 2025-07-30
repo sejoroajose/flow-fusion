@@ -65,6 +65,7 @@ func main() {
 		MaxSlippage:      cfg.TWAP.MaxSlippage,
 		RedisURL:         cfg.Redis.URL,
 		DatabaseURL:      cfg.Database.URL,
+		MaxGasPrice:      nil, 
 	}, ethClient, cosmosClient, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize TWAP engine", zap.Error(err))
@@ -173,7 +174,6 @@ func setupRouter(bridge *bridge.Service, twap *twap.Engine, logger *zap.Logger) 
 	// API routes
 	v1 := router.Group("/api/v1")
 	{
-		// Health check
 		v1.GET("/health", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"status":    "healthy",
@@ -203,12 +203,11 @@ func setupRouter(bridge *bridge.Service, twap *twap.Engine, logger *zap.Logger) 
 			twapGroup.POST("/order/:id/cancel", twap.CancelOrder)
 		}
 
-		// Metrics and monitoring
 		v1.GET("/metrics", bridge.GetMetrics)
 		v1.GET("/status", func(c *gin.Context) {
 			status := map[string]interface{}{
-				"ethereum": bridge.GetEthereumStatus(),
-				"cosmos":   bridge.GetCosmosStatus(),
+				"ethereum": bridge.GetEthereumStatusData(), 
+				"cosmos":   bridge.GetCosmosStatusData(),   
 				"twap":     twap.GetStatus(),
 			}
 			c.JSON(http.StatusOK, status)

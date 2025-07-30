@@ -528,3 +528,46 @@ func NewBridgeMetrics() *BridgeMetrics {
 		StartTime:   time.Now(),
 	}
 }
+
+func (s *Service) GetEthereumStatusData() map[string]interface{} {
+	balance, err := s.ethClient.GetBalance(context.Background())
+	if err != nil {
+		return map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		}
+	}
+
+	blockNumber, err := s.ethClient.GetCurrentBlockNumber(context.Background())
+	if err != nil {
+		return map[string]interface{}{
+			"status": "error", 
+			"error":  err.Error(),
+		}
+	}
+
+	return map[string]interface{}{
+		"status":       "connected",
+		"address":      s.ethClient.GetAddress().Hex(),
+		"balance":      balance.String(),
+		"block_number": blockNumber,
+	}
+}
+
+// GetCosmosStatusData returns Cosmos status data without handling HTTP response
+func (s *Service) GetCosmosStatusData() map[string]interface{} {
+	balance, err := s.cosmosClient.GetBalance(context.Background(), "cosmos1demo")
+	if err != nil {
+		return map[string]interface{}{
+			"status": "error",
+			"error":  err.Error(),
+		}
+	}
+
+	return map[string]interface{}{
+		"status":   "connected",
+		"chain_id": s.cosmosClient.GetChainID(),
+		"balance":  balance.String(),
+		"contract": s.cosmosClient.GetContractAddress(),
+	}
+}

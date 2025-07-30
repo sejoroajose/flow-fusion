@@ -89,6 +89,10 @@ type Config struct {
 	OneInchAPIKey string
 	ChainID       string
 	MaxGasPrice   *big.Int
+	MaxIntervals     int           
+	MinIntervalTime  time.Duration 
+	MaxSlippage      float64       
+	DatabaseURL      string  
 }
 
 // TWAPOrder represents a TWAP order
