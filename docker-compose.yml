@@ -1,0 +1,126 @@
+version: '3.8'
+
+services:
+  # Ethereum development node
+  ethereum:
+    build:
+      context: ./docker/ethereum
+      dockerfile: Dockerfile
+    ports:
+      - "8545:8545"
+    environment:
+      - FORK_URL=${ETH_FORK_URL}
+      - PRIVATE_KEY=${DEPLOYER_PRIVATE_KEY}
+    volumes:
+      - ./contracts/ethereum:/workspace
+      - ethereum_data:/data
+    command: >
+      sh -c "
+        echo 'Starting Ethereum fork...' &&
+        anvil --host 0.0.0.0 --port 8545 --fork-url $${FORK_URL} --accounts 10 --balance 10000 &
+        sleep 10 &&
+        echo 'Building contracts...' &&
+        cd /workspace && forge build &&
+        echo 'Ethereum environment ready' &&
+        wait
+      "
+
+  # Cosmos development node  
+  cosmos:
+    build:
+      context: ./docker/cosmos
+      dockerfile: Dockerfile
+    ports:
+      - "26657:26657"  # RPC
+      - "1317:1317"    # REST
+      - "9090:9090"    # gRPC
+    environment:
+      - CHAIN_ID=cosmos-1
+      - DENOM=uatom
+    volumes:
+      - ./contracts/cosmos:/contracts
+      - cosmos_data:/root/.wasmd
+    command: >
+      sh -c "
+        echo 'Initializing Cosmos chain...' &&
+        wasmd init flow-fusion-node --chain-id cosmos-1 &&
+        wasmd keys add validator --keyring-backend test &&
+        wasmd genesis add-genesis-account validator 1000000000000uatom --keyring-backend test &&  
+        wasmd genesis gentx validator 100000000uatom --chain-id cosmos-1 --keyring-backend test &&
+        wasmd genesis collect-gentxs &&
+        sed -i 's/timeout_commit = \"5s\"/timeout_commit = \"1s\"/g' ~/.wasmd/config/config.toml &&
+        sed -i 's/cors_allowed_origins = \[\]/cors_allowed_origins = [\"*\"]/g' ~/.wasmd/config/config.toml &&
+        echo 'Starting Cosmos chain...' &&
+        wasmd start --api.enable=true --api.enabled-unsafe-cors=true --grpc.enable=true
+      "
+
+  # Redis for relayer state
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # PostgreSQL for analytics
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: flowfusion
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: fusion
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # Flow Fusion Relayer (will be built later)
+  relayer:
+    build:
+      context: ./relayer
+      dockerfile: Dockerfile
+    depends_on:
+      - ethereum
+      - cosmos
+      - redis
+      - postgres
+    environment:
+      - ETHEREUM_RPC=http://ethereum:8545
+      - COSMOS_RPC=http://cosmos:26657
+      - COSMOS_GRPC=cosmos:9090
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://flow:fusion@postgres:5432/flowfusion
+      - ONEINCH_API_KEY=${ONEINCH_API_KEY}
+      - PRIVATE_KEY=${RELAYER_PRIVATE_KEY}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./relayer:/app
+    profiles:
+      - relayer
+
+  # React Frontend (will be built later)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_ETHEREUM_RPC=http://localhost:8545
+      - REACT_APP_COSMOS_RPC=http://localhost:26657
+      - REACT_APP_RELAYER_API=http://localhost:8080
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    profiles:
+      - frontend
+    depends_on:
+      - relayer
+
+volumes:
+  ethereum_data:
+  cosmos_data:
+  redis_data:
+  postgres_data:
