@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.30;
+pragma solidity ^0.8.0;
 
-import {Ownable} from "./@openzeppelin/contracts/access/Ownable.sol";
-import {IERC20} from "./@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "./@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "./@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import {IERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 import {IEscrowFactory} from "../lib/cross-chain-swap/contracts/interfaces/IEscrowFactory.sol";
 import {IBaseEscrow} from "../lib/cross-chain-swap/contracts/interfaces/IBaseEscrow.sol";
 import {TimelocksLib, Timelocks} from "../lib/cross-chain-swap/contracts/libraries/TimelocksLib.sol";
-import {AddressLib} from "../solidity-utils/contracts/libraries/AddressLib.sol";
+import {AddressLib, Address} from "../solidity-utils/contracts/libraries/AddressLib.sol";
 
 /**
  * @title FlowFusionEscrowFactory

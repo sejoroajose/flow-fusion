@@ -40,4 +40,4 @@ sha2 = "0.10"
 hex = "0.4"
 
 [dev-dependencies]
-cosmwasm-vm = { version = "1.5", default-features = false, features = ["testing", "cranelift"] }
+cosmwasm-vm = { version = "1.5", default-features = false, features = ["cranelift"] }

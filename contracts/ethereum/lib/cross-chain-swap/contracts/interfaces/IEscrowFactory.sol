@@ -3,9 +3,7 @@
 pragma solidity ^0.8.0;
 
 import { Address } from "../../../../solidity-utils/contracts/libraries/AddressLib.sol";
-
 import { Timelocks } from "../libraries/TimelocksLib.sol";
-
 import { IBaseEscrow } from "./IBaseEscrow.sol";
 
 /**
@@ -55,6 +53,15 @@ interface IEscrowFactory {
     /// @notice Returns the address of implementation on the destination chain.
     function ESCROW_DST_IMPLEMENTATION() external view returns (address);
     /* solhint-enable func-name-mixedcase */
+
+    /**
+     * @notice Creates a new escrow contract for maker on the source chain.
+     * @dev The caller must send the safety deposit in the native token along with the function call
+     * and approve the source token to be transferred to the created escrow.
+     * @param srcImmutables The immutables of the escrow contract that are used in deployment.
+     * @param dstCancellationTimestamp The start of the cancellation period for the destination chain.
+     */
+    function createSrcEscrow(IBaseEscrow.Immutables calldata srcImmutables, uint256 dstCancellationTimestamp) external payable;
 
     /**
      * @notice Creates a new escrow contract for taker on the destination chain.

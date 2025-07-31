@@ -1,10 +1,11 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Deps, DepsMut, Env, MessageInfo, 
-    Response, StdResult, Uint128, WasmMsg, ensure, Timestamp,
+    to_json_binary, BankMsg, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo, 
+    Response, StdResult, Uint128, ensure,
 };
 use cw2::set_contract_version;
+use cw_storage_plus::Bound;
 use sha2::{Digest, Sha256};
 
 use crate::error::ContractError;
@@ -24,9 +25,16 @@ pub fn instantiate(
 ) -> Result<Response, ContractError> {
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
+    // Fix: Handle the type conversion properly
+    let fee_collector = if let Some(collector) = msg.fee_collector {
+        deps.api.addr_validate(&collector)?
+    } else {
+        info.sender.clone()
+    };
+
     let config = Config {
         owner: info.sender.clone(),
-        fee_collector: msg.fee_collector.unwrap_or(info.sender),
+        fee_collector,
         fee_rate: msg.fee_rate.unwrap_or(0), // 0 = no fees for hackathon
     };
 
@@ -140,7 +148,7 @@ pub fn execute_create_escrow(
 
 pub fn execute_withdraw(
     deps: DepsMut,
-    env: Env,
+    _env: Env, // Fixed: prefix with underscore to avoid warning
     info: MessageInfo,
     escrow_id: u64,
     secret: String,
@@ -264,8 +272,14 @@ fn query_escrows(
     let limit = limit.unwrap_or(10).min(100) as usize;
     let start = start_after.map(|id| id + 1).unwrap_or(1);
 
+    // Fix: Use proper Bound syntax for range queries
     let escrows: StdResult<Vec<_>> = ESCROWS
-        .range(deps.storage, Some(start.into()), None, cosmwasm_std::Order::Ascending)
+        .range(
+            deps.storage, 
+            Some(Bound::inclusive(start)), 
+            None, 
+            cosmwasm_std::Order::Ascending
+        )
         .take(limit)
         .map(|item| item.map(|(_, escrow)| escrow))
         .collect();
