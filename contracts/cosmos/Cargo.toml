@@ -1,19 +1,18 @@
+# Cargo.toml - Absolute minimal dependencies
 [package]
 name = "flow-fusion-cosmos"
 version = "1.0.0"
-authors = ["Flow Fusion Team"]
 edition = "2021"
 
-exclude = [
-  "contract.wasm",
-  "hash.txt",
-]
-
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
+
+[dependencies]
+cosmwasm-std = { version = "1.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 
 [profile.release]
-opt-level = 3
+opt-level = 'z'
 debug = false
 rpath = false
 lto = true
@@ -22,22 +21,3 @@ codegen-units = 1
 panic = 'abort'
 incremental = false
 overflow-checks = true
-
-[features]
-default = ["cranelift"]
-cranelift = ["cosmwasm-vm/cranelift"]
-library = []
-
-[dependencies]
-cosmwasm-std = "1.5"
-cosmwasm-storage = "1.5"
-cw-storage-plus = "1.2"
-cw2 = "1.1"
-schemars = "0.8"
-serde = { version = "1.0", default-features = false, features = ["derive"] }
-thiserror = "1.0"
-sha2 = "0.10"
-hex = "0.4"
-
-[dev-dependencies]
-cosmwasm-vm = { version = "1.5", default-features = false, features = ["cranelift"] }
