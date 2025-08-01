@@ -1,0 +1,11 @@
+image: gitpod/workspace-rust
+
+tasks:
+  - init: |
+      rustup target add wasm32-unknown-unknown
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.69.0
+      rustup target add wasm32-unknown-unknown --toolchain 1.69.0
+
+vscode:
+  extensions:
+    - rust-lang.rust-analyzer
