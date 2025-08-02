@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"log"
 
 	"github.com/joho/godotenv"
 	vault "github.com/hashicorp/vault/api"
@@ -158,14 +159,13 @@ const (
 	EnvTest        = "test"
 )
 
-// Load configuration from multiple sources with proper precedence
 func Load() (*Config, error) {
-	// Load .env file if it exists (development)
-	_ = godotenv.Load()
+	if err := godotenv.Load("../../../.env"); err != nil {
+		log.Printf("Warning: Could not load .env file: %v", err)
+	}
 
 	environment := getEnvString("ENVIRONMENT", EnvDevelopment)
 	
-	// Load base configuration
 	config := &Config{
 		Server: ServerConfig{
 			Port:           getEnvInt("SERVER_PORT", 8080),
@@ -173,7 +173,7 @@ func Load() (*Config, error) {
 			ReadTimeout:    getEnvDuration("SERVER_READ_TIMEOUT", 30*time.Second),
 			WriteTimeout:   getEnvDuration("SERVER_WRITE_TIMEOUT", 30*time.Second),
 			IdleTimeout:    getEnvDuration("SERVER_IDLE_TIMEOUT", 120*time.Second),
-			MaxHeaderBytes: getEnvInt("SERVER_MAX_HEADER_BYTES", 1048576), // 1MB
+			MaxHeaderBytes: getEnvInt("SERVER_MAX_HEADER_BYTES", 1048576),
 			TLSCertFile:    getEnvString("TLS_CERT_FILE", ""),
 			TLSKeyFile:     getEnvString("TLS_KEY_FILE", ""),
 			EnableHTTPS:    getEnvBool("ENABLE_HTTPS", false),
@@ -184,7 +184,7 @@ func Load() (*Config, error) {
 			ChainID:            int64(getEnvInt("ETHEREUM_CHAIN_ID", 1)),
 			ContractAddr:       getEnvString("ETHEREUM_CONTRACT_ADDR", ""),
 			GasLimit:           uint64(getEnvInt("ETHEREUM_GAS_LIMIT", 500000)),
-			MaxGasPrice:        getEnvString("ETHEREUM_MAX_GAS_PRICE", "100000000000"), // 100 gwei
+			MaxGasPrice:        getEnvString("ETHEREUM_MAX_GAS_PRICE", "100000000000"), 
 			GasPriceMultiplier: getEnvFloat("ETHEREUM_GAS_PRICE_MULTIPLIER", 1.1),
 			ConfirmationBlocks: uint64(getEnvInt("ETHEREUM_CONFIRMATION_BLOCKS", 3)),
 			RetryAttempts:      getEnvInt("ETHEREUM_RETRY_ATTEMPTS", 3),
@@ -296,15 +296,12 @@ func Load() (*Config, error) {
 
 // loadSecrets loads sensitive configuration from secure sources
 func loadSecrets(config *Config, environment string) error {
-	// Try to load from HashiCorp Vault in production
 	if environment == EnvProduction {
 		if err := loadFromVault(config); err != nil {
-			// Fall back to environment variables with warning
 			fmt.Printf("Warning: Failed to load from Vault, using environment variables: %v\n", err)
 			loadSecretsFromEnv(config)
 		}
 	} else {
-		// Use environment variables for non-production
 		loadSecretsFromEnv(config)
 	}
 
