@@ -79,7 +79,7 @@ type BridgeOrder struct {
 	
 	// 1inch Fusion+ specific fields
 	OneInchOrderHash    string                 `json:"oneinch_order_hash"`
-	Secrets             []string               `json:"-"` // Never expose secrets
+	Secrets             []string               `json:"-"` // Never expose secret
 	SecretHashes        []string               `json:"secret_hashes"`
 	HashLock            *fusionplus.HashLock   `json:"-"`
 	FusionPlusOrder     *fusionplus.Order      `json:"fusion_plus_order,omitempty"`
