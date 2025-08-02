@@ -1,7 +1,7 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_binary, BankMsg, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo, 
+    to_json_binary, BankMsg, Binary, CosmosMsg, Deps, DepsMut, Env, MessageInfo, 
     Response, StdResult,
 };
 use cw2::set_contract_version;
@@ -91,7 +91,7 @@ pub fn execute_create_escrow(
     recipient: String,
     ethereum_sender: String,
 ) -> Result<Response, ContractError> {
-    // Validate inputs - using manual checks instead of ensure!
+    // Validate inputs
     if ethereum_tx_hash.is_empty() {
         return Err(ContractError::InvalidInput("ethereum_tx_hash cannot be empty".to_string()));
     }
@@ -281,12 +281,12 @@ pub fn execute_update_config(
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::GetEscrow { escrow_id } => to_binary(&query_escrow(deps, escrow_id)?),
+        QueryMsg::GetEscrow { escrow_id } => to_json_binary(&query_escrow(deps, escrow_id)?),
         QueryMsg::GetEscrows { 
             start_after, 
             limit 
-        } => to_binary(&query_escrows(deps, start_after, limit)?),
-        QueryMsg::GetConfig {} => to_binary(&CONFIG.load(deps.storage)?),
+        } => to_json_binary(&query_escrows(deps, start_after, limit)?),
+        QueryMsg::GetConfig {} => to_json_binary(&CONFIG.load(deps.storage)?),
     }
 }
 

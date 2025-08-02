@@ -1,16 +1,13 @@
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
+use cosmwasm_schema::{cw_serde, QueryResponses};
 use crate::state::{Config, Escrow};
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[cw_serde]
 pub struct InstantiateMsg {
     pub fee_collector: Option<String>,
     pub fee_rate: Option<u64>, // Basis points (10000 = 100%)
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[cw_serde]
 pub enum ExecuteMsg {
     CreateEscrow {
         ethereum_tx_hash: String,
@@ -32,31 +29,27 @@ pub enum ExecuteMsg {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[cw_serde]
+#[derive(QueryResponses)]
 pub enum QueryMsg {
-    GetEscrow {
-        escrow_id: u64,
-    },
+    #[returns(EscrowResponse)]
+    GetEscrow { escrow_id: u64 },
+    #[returns(EscrowsResponse)]
     GetEscrows {
         start_after: Option<u64>,
         limit: Option<u32>,
     },
+    #[returns(Config)]
     GetConfig {},
 }
 
 // Response types
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[cw_serde]
 pub struct EscrowResponse {
     pub escrow: Escrow,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[cw_serde]
 pub struct EscrowsResponse {
     pub escrows: Vec<Escrow>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct ConfigResponse {
-    pub config: Config,
 }

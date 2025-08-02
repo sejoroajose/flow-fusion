@@ -1,0 +1,1 @@
+fb5e355bdf43c94f78033810c191eb459296dc76be3c51de3faa8d436d974e50  flow_fusion_cosmos.wasm
