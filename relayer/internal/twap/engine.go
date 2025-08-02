@@ -21,15 +21,15 @@ import (
 	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
 	"github.com/1inch/1inch-sdk-go/sdk-clients/aggregation"
 	"github.com/1inch/1inch-sdk-go/sdk-clients/tokens"
-	"github.com/1inch/1inch-sdk-go/constants"
 
 	"flow-fusion/relayer/internal/cosmos"
 	"flow-fusion/relayer/internal/ethereum"
+	"flow-fusion/relayer/internal/config"
 )
 
 // ProductionTWAPEngine implements TWAP execution using 1inch Fusion+ SDK
 type ProductionTWAPEngine struct {
-	config            Config
+	config            *config.Config
 	ethClient         *ethereum.Client
 	cosmosClient      *cosmos.Client
 	logger            *zap.Logger
