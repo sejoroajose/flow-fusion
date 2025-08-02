@@ -385,19 +385,6 @@ func (c *HTTPClient) GetTokenInfo(ctx context.Context, tokenAddress string) (*To
 	return &response, err
 }
 
-// Helper methods for crypto operations (previously from SDK)
-func (c *HTTPClient) GenerateRandomBytes32() (string, error) {
-	// This would need to be implemented - generate 32 random bytes
-	// You can use crypto/rand for this
-	return "", fmt.Errorf("implement random bytes generation")
-}
-
-func (c *HTTPClient) HashSecret(secret string) (string, error) {
-	// This would need to be implemented - hash the secret
-	// You can use crypto/sha256 or keccak256 for this
-	return "", fmt.Errorf("implement secret hashing")
-}
-
 // Utility methods
 func (c *HTTPClient) SetChainID(chainID uint64) {
 	c.chainID = chainID

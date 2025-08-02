@@ -16,6 +16,7 @@ import (
 	"flow-fusion/relayer/internal/config"
 	"flow-fusion/relayer/internal/cosmos"
 	"flow-fusion/relayer/internal/ethereum"
+	"flow-fusion/relayer/internal/oneinch"
 	"flow-fusion/relayer/internal/twap"
 )
 
@@ -27,7 +28,7 @@ func main() {
 	}
 	defer logger.Sync()
 
-	logger.Info("Starting Flow Fusion Production Relayer with 1inch Integration")
+	logger.Info("Starting Flow Fusion Production Relayer with 1inch HTTP API Integration")
 
 	// Load configuration
 	cfg, err := config.Load()
@@ -42,7 +43,7 @@ func main() {
 		ChainID:         cfg.Ethereum.ChainID,
 		ContractAddress: cfg.Ethereum.ContractAddr,
 		GasLimit:        500000,
-		MaxGasPrice:     "50000000000", // 50 gwei
+		MaxGasPrice:     "50000000000", 
 	}, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize Ethereum client", zap.Error(err))
@@ -55,13 +56,13 @@ func main() {
 		ChainID:      cfg.Cosmos.ChainID,
 		Mnemonic:     cfg.Cosmos.Mnemonic,
 		Denom:        cfg.Cosmos.Denom,
-		ContractAddr: "cosmos1contract", // Your deployed Cosmos contract
+		ContractAddr: "BB4124578492DA44754DAE2B22AEAA8604D32BC0B82B93098CB9AF86C9E5A84D", // deployed Cosmos contract
 	}, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize Cosmos client", zap.Error(err))
 	}
 
-	// Initialize Production TWAP Engine with 1inch SDK
+	// Initialize Production TWAP Engine with 1inch HTTP API
 	twapEngine, err := twap.NewProductionTWAPEngine(twap.Config{
 		RedisURL:        cfg.Redis.URL,
 		OneInchAPIKey:   cfg.OneInch.APIKey,
@@ -78,7 +79,7 @@ func main() {
 		logger.Fatal("Failed to initialize Production TWAP engine", zap.Error(err))
 	}
 
-	// Initialize Fusion+ Bridge Service
+	// Initialize Fusion+ Bridge Service with HTTP API
 	bridgeService, err := bridge.NewFusionBridgeService(bridge.Config{
 		EthereumClient: ethClient,
 		CosmosClient:   cosmosClient,
@@ -97,7 +98,7 @@ func main() {
 	defer cancel()
 
 	// Start background services
-	logger.Info("Starting production background services")
+	logger.Info("Starting production background services with HTTP API integration")
 
 	go func() {
 		if err := twapEngine.Start(ctx); err != nil {
@@ -112,7 +113,7 @@ func main() {
 	}()
 
 	// Setup production HTTP server with proper middleware
-	router := setupProductionRouter(bridgeService, twapEngine, logger)
+	router := setupProductionRouter(bridgeService, twapEngine, logger, cfg.OneInch.APIKey)
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
 		Handler:      router,
@@ -154,7 +155,7 @@ func main() {
 	logger.Info("Flow Fusion Production Relayer stopped successfully")
 }
 
-func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine *twap.ProductionTWAPEngine, logger *zap.Logger) *gin.Engine {
+func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine *twap.ProductionTWAPEngine, logger *zap.Logger, oneInchAPIKey string) *gin.Engine {
 	// Set Gin to production mode
 	gin.SetMode(gin.ReleaseMode)
 	
@@ -174,6 +175,31 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 			"timestamp": time.Now().Unix(),
 			"version":   "1.0.0",
 			"service":   "flow-fusion-relayer",
+			"api_type":  "http",
+		})
+	})
+
+	// API status endpoint with 1inch HTTP API status
+	router.GET("/api/health", func(c *gin.Context) {
+		oneInchClient := oneinch.NewHTTPClient(oneinch.Config{
+			BaseURL: "https://api.1inch.dev",
+			APIKey:  oneInchAPIKey,
+			ChainID: 1,
+			Timeout: 5 * time.Second,
+		}, logger)
+
+		// Test token endpoint
+		tokens, err := oneInchClient.GetTokens(c.Request.Context())
+		oneInchStatus := "healthy"
+		if err != nil || len(tokens) == 0 {
+			oneInchStatus = "unhealthy"
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":       "healthy",
+			"timestamp":    time.Now().Unix(),
+			"oneinch_api":  oneInchStatus,
+			"api_type":     "http",
 		})
 	})
 
@@ -185,15 +211,16 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 			"ethereum":  bridgeService.GetEthereumStatusData(),
 			"cosmos":    bridgeService.GetCosmosStatusData(),
 			"timestamp": time.Now().Unix(),
+			"api_type":  "http",
 		}
 		c.JSON(http.StatusOK, metrics)
 	})
 
 	// API routes
 	api := router.Group("/api/v1")
-	api.Use(authMiddleware()) // Add authentication for production
+	api.Use(authMiddleware()) 
 	{
-		// Bridge endpoints using Fusion+
+		// Bridge endpoints using 1inch HTTP API
 		bridgeGroup := api.Group("/bridge")
 		{
 			bridgeGroup.POST("/quote", bridgeService.GetQuote)
@@ -203,7 +230,7 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 			bridgeGroup.POST("/order/:id/cancel", bridgeService.CancelOrder)
 		}
 
-		// TWAP endpoints with 1inch integration
+		// TWAP endpoints with 1inch HTTP API integration
 		twapGroup := api.Group("/twap")
 		{
 			twapGroup.POST("/quote", twapEngine.GetQuote)
@@ -213,13 +240,13 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 			twapGroup.POST("/order/:id/cancel", twapEngine.CancelOrder)
 		}
 
-		// 1inch API integration endpoints
+		// 1inch HTTP API integration endpoints
 		oneinchGroup := api.Group("/oneinch")
 		{
-			oneinchGroup.GET("/tokens", getTokenInfo)
-			oneinchGroup.POST("/swap/quote", getSwapQuote)
-			oneinchGroup.POST("/fusion/quote", getFusionQuote)
-			oneinchGroup.POST("/orderbook/quote", getOrderbookQuote)
+			oneinchGroup.GET("/tokens", getTokenInfo(oneInchAPIKey, logger))
+			oneinchGroup.POST("/swap/quote", getSwapQuote(oneInchAPIKey, logger))
+			oneinchGroup.POST("/fusion/quote", getFusionQuote(oneInchAPIKey, logger))
+			oneinchGroup.POST("/orderbook/quote", getOrderbookQuote(oneInchAPIKey, logger))
 		}
 
 		// System status and monitoring
@@ -231,6 +258,7 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 				"bridge":    bridgeService.GetMetricsData(),  
 				"timestamp": time.Now().Unix(),
 				"uptime":    time.Since(startTime).String(),
+				"api_type":  "http",
 			}
 			c.JSON(http.StatusOK, status)
 		})
@@ -325,40 +353,196 @@ func validateAPIKey(apiKey string) bool {
 	return validKeys[apiKey]
 }
 
-// 1inch API integration endpoints
-func getTokenInfo(c *gin.Context) {
-	// Implementation using the tokens client
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Token info endpoint - integrate with tokens.Client",
-	})
+// 1inch HTTP API integration endpoints
+func getTokenInfo(oneInchAPIKey string, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		chainID := c.DefaultQuery("chainId", "1")
+		
+		oneInchClient := oneinch.NewHTTPClient(oneinch.Config{
+			BaseURL: "https://api.1inch.dev",
+			APIKey:  oneInchAPIKey,
+			ChainID: 1, // Will be parsed from chainID param
+			Timeout: 30 * time.Second,
+		}, logger)
+
+		tokens, err := oneInchClient.GetTokens(c.Request.Context())
+		if err != nil {
+			logger.Error("Failed to get tokens from 1inch API", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to fetch token information",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"tokens":   tokens,
+			"chainId":  chainID,
+			"api_type": "http",
+		})
+	}
 }
 
-func getSwapQuote(c *gin.Context) {
-	// Implementation using the aggregation client
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Swap quote endpoint - integrate with aggregation.Client",
-	})
+func getSwapQuote(oneInchAPIKey string, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Src      string  `json:"src" binding:"required"`
+			Dst      string  `json:"dst" binding:"required"`
+			Amount   string  `json:"amount" binding:"required"`
+			From     string  `json:"from" binding:"required"`
+			Slippage float64 `json:"slippage" binding:"required"`
+			ChainID  uint64  `json:"chainId"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		if req.ChainID == 0 {
+			req.ChainID = 1
+		}
+
+		oneInchClient := oneinch.NewHTTPClient(oneinch.Config{
+			BaseURL: "https://api.1inch.dev",
+			APIKey:  oneInchAPIKey,
+			ChainID: req.ChainID,
+			Timeout: 30 * time.Second,
+		}, logger)
+
+		quote, err := oneInchClient.GetSwap(
+			c.Request.Context(),
+			req.Src,
+			req.Dst,
+			req.Amount,
+			req.From,
+			req.Slippage,
+			nil,
+		)
+		if err != nil {
+			logger.Error("Failed to get swap quote from 1inch API", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to get swap quote",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"quote":    quote,
+			"api_type": "http",
+		})
+	}
 }
 
-func getFusionQuote(c *gin.Context) {
-	// Implementation using the fusion+ client
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Fusion+ quote endpoint - integrate with fusionplus.Client",
-	})
+func getFusionQuote(oneInchAPIKey string, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			SrcChain        uint64 `json:"srcChain" binding:"required"`
+			DstChain        uint64 `json:"dstChain" binding:"required"`
+			SrcTokenAddress string `json:"srcTokenAddress" binding:"required"`
+			DstTokenAddress string `json:"dstTokenAddress" binding:"required"`
+			Amount          string `json:"amount" binding:"required"`
+			WalletAddress   string `json:"walletAddress" binding:"required"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		oneInchClient := oneinch.NewHTTPClient(oneinch.Config{
+			BaseURL: "https://api.1inch.dev",
+			APIKey:  oneInchAPIKey,
+			ChainID: req.SrcChain,
+			Timeout: 30 * time.Second,
+		}, logger)
+
+		quote, err := oneInchClient.GetFusionQuote(
+			c.Request.Context(),
+			req.SrcChain,
+			req.DstChain,
+			req.SrcTokenAddress,
+			req.DstTokenAddress,
+			req.Amount,
+			req.WalletAddress,
+		)
+		if err != nil {
+			logger.Error("Failed to get Fusion+ quote from 1inch API", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to get Fusion+ quote",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"quote":    quote,
+			"api_type": "http",
+		})
+	}
 }
 
-func getOrderbookQuote(c *gin.Context) {
-	// Implementation using the orderbook client
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Orderbook quote endpoint - integrate with orderbook.Client",
-	})
+func getOrderbookQuote(oneInchAPIKey string, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			MakerAddress string `json:"makerAddress" binding:"required"`
+			ChainID      uint64 `json:"chainId"`
+			Limit        int    `json:"limit"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		if req.ChainID == 0 {
+			req.ChainID = 1
+		}
+		if req.Limit == 0 {
+			req.Limit = 100
+		}
+
+		oneInchClient := oneinch.NewHTTPClient(oneinch.Config{
+			BaseURL: "https://api.1inch.dev",
+			APIKey:  oneInchAPIKey,
+			ChainID: req.ChainID,
+			Timeout: 30 * time.Second,
+		}, logger)
+
+		orders, err := oneInchClient.GetOrderbookOrdersByMaker(
+			c.Request.Context(),
+			req.MakerAddress,
+			req.Limit,
+		)
+		if err != nil {
+			logger.Error("Failed to get orderbook orders from 1inch API", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to get orderbook orders",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"orders":   orders,
+			"api_type": "http",
+		})
+	}
 }
 
 func serveSwaggerDocs() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Serve Swagger/OpenAPI documentation
 		c.JSON(http.StatusOK, gin.H{
-			"message": "API documentation - implement Swagger/OpenAPI docs",
+			"message":  "API documentation - implement Swagger/OpenAPI docs",
+			"api_type": "http",
+			"endpoints": map[string]string{
+				"bridge_quote":    "POST /api/v1/bridge/quote",
+				"bridge_order":    "POST /api/v1/bridge/order",
+				"twap_quote":      "POST /api/v1/twap/quote", 
+				"twap_order":      "POST /api/v1/twap/order",
+				"oneinch_tokens":  "GET /api/v1/oneinch/tokens",
+				"health":          "GET /health",
+				"metrics":         "GET /metrics",
+				"status":          "GET /api/v1/status",
+			},
 		})
 	}
 }

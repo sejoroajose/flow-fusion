@@ -1,3 +1,4 @@
+// relayer/internal/twap/engine.go
 package twap
 
 import (
@@ -7,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"reflect"
 	"sync"
 	"time"
 
@@ -18,28 +18,20 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 
-	"github.com/1inch/1inch-sdk-go/sdk-clients/fusionplus"
-	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
-	"github.com/1inch/1inch-sdk-go/sdk-clients/aggregation"
-	"github.com/1inch/1inch-sdk-go/sdk-clients/tokens"
-
 	"flow-fusion/relayer/internal/cosmos"
 	"flow-fusion/relayer/internal/ethereum"
-	
+	"flow-fusion/relayer/internal/oneinch"
 )
 
-// ProductionTWAPEngine implements TWAP execution using 1inch Fusion+ SDK
+// ProductionTWAPEngine implements TWAP execution using 1inch HTTP API
 type ProductionTWAPEngine struct {
 	config            Config
 	ethClient         *ethereum.Client
 	cosmosClient      *cosmos.Client
 	logger            *zap.Logger
 	
-	// 1inch SDK clients - use interface types for better compatibility
-	fusionPlusClient  *fusionplus.Client
-	orderbookClient   *orderbook.Client
-	aggregationClient interface{} 
-	tokensClient      *tokens.Client
+	// 1inch HTTP client
+	oneInchClient     *oneinch.HTTPClient
 	
 	// State management
 	twapOrders        map[string]*TWAPOrder
@@ -90,7 +82,7 @@ type TWAPOrder struct {
 	CompletedWindows int                  `json:"completed_windows"`
 	TotalExecuted    *big.Int             `json:"total_executed"`
 	
-	// 1inch integration
+	// 1inch integration using HTTP API
 	FusionPlusOrders []*FusionPlusOrderRef `json:"fusion_plus_orders"`
 	OrderbookOrders  []*OrderbookOrderRef  `json:"orderbook_orders"`
 }
@@ -175,8 +167,8 @@ type TWAPQuoteResponse struct {
 	ExecutionSchedule []SchedulePreview         `json:"execution_schedule"`
 	Fees              FeeBreakdown              `json:"fees"`
 	Recommendations   []string                  `json:"recommendations"`
-	FusionPlusQuote   interface{}               `json:"fusion_plus_quote,omitempty"`
-	OrderbookQuote    interface{}               `json:"orderbook_quote,omitempty"`
+	FusionPlusQuote   *oneinch.FusionQuoteResponse `json:"fusion_plus_quote,omitempty"`
+	OrderbookQuote    *oneinch.SwapResponse        `json:"orderbook_quote,omitempty"`
 }
 
 type PriceImpactComparison struct {
@@ -199,77 +191,6 @@ type FeeBreakdown struct {
 	RelayerFee       string `json:"relayer_fee"`
 	OneInchFee       string `json:"oneinch_fee"`
 	Total            string `json:"total"`
-}
-
-// Helper function to safely extract string value from a struct field using reflection
-/* func getStringFieldValue(obj interface{}, fieldNames ...string) string {
-	if obj == nil {
-		return ""
-	}
-	
-	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return ""
-		}
-		v = v.Elem()
-	}
-	
-	if v.Kind() != reflect.Struct {
-		return ""
-	}
-	
-	for _, fieldName := range fieldNames {
-		field := v.FieldByName(fieldName)
-		if field.IsValid() && field.Kind() == reflect.String {
-			return field.String()
-		}
-	}
-	
-	return ""
-} */
-
-// Helper function to safely extract int value from a struct field using reflection
-func getIntFieldValue(obj interface{}, fieldNames ...string) int {
-	if obj == nil {
-		return 0
-	}
-	
-	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return 0
-		}
-		v = v.Elem()
-	}
-	
-	if v.Kind() != reflect.Struct {
-		return 0
-	}
-	
-	for _, fieldName := range fieldNames {
-		field := v.FieldByName(fieldName)
-		if field.IsValid() && field.CanInt() {
-			return int(field.Int())
-		}
-	}
-	
-	return 0
-}
-
-// Helper function to call GetSwap method on either aggregation client type
-func (e *ProductionTWAPEngine) callGetSwap(ctx context.Context, params aggregation.GetSwapParams) (interface{}, error) {
-	// Try ClientOnlyAPI first
-	if clientAPI, ok := e.aggregationClient.(*aggregation.ClientOnlyAPI); ok {
-		return clientAPI.GetSwap(ctx, params)
-	}
-	
-	// Try regular Client
-	if client, ok := e.aggregationClient.(*aggregation.Client); ok {
-		return client.GetSwap(ctx, params)
-	}
-	
-	return nil, fmt.Errorf("aggregation client type not supported")
 }
 
 func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosClient *cosmos.Client, logger *zap.Logger) (*ProductionTWAPEngine, error) {
@@ -295,77 +216,22 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
-	// Initialize Fusion+ client
-	fusionConfig, err := fusionplus.NewConfiguration(fusionplus.ConfigurationParams{
-		ApiUrl:     "https://api.1inch.dev",
-		ApiKey:     config.OneInchAPIKey,
-		PrivateKey: config.PrivateKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Fusion+ config: %w", err)
+	// Initialize 1inch HTTP client
+	oneInchConfig := oneinch.Config{
+		BaseURL: "https://api.1inch.dev",
+		APIKey:  config.OneInchAPIKey,
+		ChainID: uint64(config.ChainID),
+		Timeout: 30 * time.Second,
 	}
 
-	fusionClient, err := fusionplus.NewClient(fusionConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Fusion+ client: %w", err)
-	}
-
-	// Initialize Orderbook client - fix ChainID type conversion
-	orderbookConfig, err := orderbook.NewConfiguration(orderbook.ConfigurationParams{
-		NodeUrl:    config.NodeURL,
-		PrivateKey: config.PrivateKey,
-		ChainId:    uint64(config.ChainID), 
-		ApiUrl:     "https://api.1inch.dev",
-		ApiKey:     config.OneInchAPIKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Orderbook config: %w", err)
-	}
-
-	orderbookClient, err := orderbook.NewClient(orderbookConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Orderbook client: %w", err)
-	}
-
-	// Initialize Aggregation client
-	aggConfig, err := aggregation.NewConfigurationAPI(
-		uint64(config.ChainID),
-		"https://api.1inch.dev",
-		config.OneInchAPIKey,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Aggregation config: %w", err)
-	}
-
-	aggClient, err := aggregation.NewClientOnlyAPI(aggConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Aggregation client: %w", err)
-	}
-
-	// Initialize Tokens client
-	tokensConfig, err := tokens.NewConfiguration(tokens.ConfigurationParams{
-		ChainId: uint64(config.ChainID),
-		ApiUrl:  "https://api.1inch.dev",
-		ApiKey:  config.OneInchAPIKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Tokens config: %w", err)
-	}
-
-	tokensClient, err := tokens.NewClient(tokensConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Tokens client: %w", err)
-	}
+	oneInchClient := oneinch.NewHTTPClient(oneInchConfig, logger)
 
 	engine := &ProductionTWAPEngine{
 		config:            config,  
 		ethClient:         ethClient,
 		cosmosClient:      cosmosClient,
 		logger:            logger,
-		fusionPlusClient:  fusionClient,
-		orderbookClient:   orderbookClient,
-		aggregationClient: aggClient, // Store as interface{}
-		tokensClient:      tokensClient,
+		oneInchClient:     oneInchClient,
 		twapOrders:        make(map[string]*TWAPOrder),
 		redisClient:       redisClient,
 		rateLimiter:       rate.NewLimiter(rate.Limit(5), 10), 
@@ -382,7 +248,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 }
 
 func (e *ProductionTWAPEngine) Start(ctx context.Context) error {
-	e.logger.Info("Starting Production TWAP Engine with 1inch Integration",
+	e.logger.Info("Starting Production TWAP Engine with 1inch HTTP API Integration",
 		zap.String("public_address", e.publicAddress.Hex()),
 		zap.Int("chain_id", e.chainID),
 	)
@@ -467,54 +333,50 @@ func (e *ProductionTWAPEngine) CreateOrder(c *gin.Context) {
 }
 
 func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int) (*TWAPQuoteResponse, error) {
-	// Get instant swap quote for comparison
-	instantQuote, err := e.callGetSwap(ctx, aggregation.GetSwapParams{
-		Src:             req.SourceToken,
-		Dst:             req.DestToken,
-		Amount:          totalAmount.String(),
-		From:            req.UserAddress,
-		Slippage:        float32(req.MaxSlippage), // Convert float64 to float32
-		DisableEstimate: true,
-	})
+	// Get instant swap quote for comparison using HTTP API
+	instantQuote, err := e.oneInchClient.GetSwap(
+		ctx,
+		req.SourceToken,
+		req.DestToken,
+		totalAmount.String(),
+		req.UserAddress,
+		req.MaxSlippage,
+		map[string]string{
+			"disableEstimate": "false",
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instant quote: %w", err)
 	}
 
 	// Calculate interval amount and get interval quote
 	intervalAmount := new(big.Int).Div(totalAmount, big.NewInt(int64(req.IntervalCount)))
-	intervalQuote, err := e.callGetSwap(ctx, aggregation.GetSwapParams{
-		Src:             req.SourceToken,
-		Dst:             req.DestToken,
-		Amount:          intervalAmount.String(),
-		From:            req.UserAddress,
-		Slippage:        float32(req.MaxSlippage), // Convert float64 to float32
-		DisableEstimate: true,
-	})
+	intervalQuote, err := e.oneInchClient.GetSwap(
+		ctx,
+		req.SourceToken,
+		req.DestToken,
+		intervalAmount.String(),
+		req.UserAddress,
+		req.MaxSlippage,
+		map[string]string{
+			"disableEstimate": "false",
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interval quote: %w", err)
 	}
 
-	// Calculate estimated TWAP output using reflection to handle different response types
-	intervalOutputStr := getStringFieldValue(intervalQuote, "ToTokenAmount", "ToAmount", "DstAmount", "OutputAmount")
-	if intervalOutputStr == "" {
-		return nil, fmt.Errorf("unable to extract output amount from interval quote")
-	}
-	
-	intervalOutput, ok := new(big.Int).SetString(intervalOutputStr, 10)
+	// Calculate estimated TWAP output
+	intervalOutput, ok := new(big.Int).SetString(intervalQuote.DstAmount, 10)
 	if !ok {
-		return nil, fmt.Errorf("invalid interval output amount: %s", intervalOutputStr)
+		return nil, fmt.Errorf("invalid interval output amount: %s", intervalQuote.DstAmount)
 	}
 	twapEstimatedOutput := new(big.Int).Mul(intervalOutput, big.NewInt(int64(req.IntervalCount)))
 
 	// Compare price impacts
-	instantOutputStr := getStringFieldValue(instantQuote, "ToTokenAmount", "ToAmount", "DstAmount", "OutputAmount")
-	if instantOutputStr == "" {
-		return nil, fmt.Errorf("unable to extract output amount from instant quote")
-	}
-	
-	instantOutput, ok := new(big.Int).SetString(instantOutputStr, 10)
+	instantOutput, ok := new(big.Int).SetString(instantQuote.DstAmount, 10)
 	if !ok {
-		return nil, fmt.Errorf("invalid instant output amount: %s", instantOutputStr)
+		return nil, fmt.Errorf("invalid instant output amount: %s", instantQuote.DstAmount)
 	}
 
 	instantImpact := e.calculatePriceImpact(totalAmount, instantOutput)
@@ -526,7 +388,7 @@ func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req Creat
 	}
 
 	// Get Fusion+ quote if requested
-	var fusionPlusQuote interface{}
+	var fusionPlusQuote *oneinch.FusionQuoteResponse
 	if req.UseFusionPlus {
 		fusionQuote, err := e.getFusionPlusQuote(ctx, req, intervalAmount)
 		if err != nil {
@@ -539,10 +401,14 @@ func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req Creat
 	// Generate execution schedule
 	schedule := e.generateExecutionSchedule(req, totalAmount)
 
-	// Calculate fees - extract gas estimate using reflection
-	gasEstimate := getIntFieldValue(instantQuote, "EstimatedGas", "Gas", "GasLimit", "EstimatedGasLimit")
-	if gasEstimate == 0 {
-		gasEstimate = 300000 // Default gas estimate
+	// Calculate fees
+	var gasEstimate int = 300000 // Default gas estimate
+	if instantQuote.EstimatedGas != "" {
+		if gasStr := instantQuote.EstimatedGas; gasStr != "" {
+			if parsed, parseErr := new(big.Int).SetString(gasStr, 10); parseErr {
+				gasEstimate = int(parsed.Int64())
+			}
+		}
 	}
 	fees := e.calculateFees(req, gasEstimate)
 
@@ -558,25 +424,24 @@ func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req Creat
 		Fees:              fees,
 		Recommendations:   e.generateRecommendations(instantImpact, twapImpact, req.IntervalCount),
 		FusionPlusQuote:   fusionPlusQuote,
+		OrderbookQuote:    intervalQuote,
 	}, nil
 }
 
-func (e *ProductionTWAPEngine) getFusionPlusQuote(ctx context.Context, req CreateTWAPOrderRequest, intervalAmount *big.Int) (interface{}, error) {
+func (e *ProductionTWAPEngine) getFusionPlusQuote(ctx context.Context, req CreateTWAPOrderRequest, intervalAmount *big.Int) (*oneinch.FusionQuoteResponse, error) {
 	// Get source and destination chain IDs
-	srcChain := float32(e.chainID)
-	dstChain := float32(1) // Cosmos or target chain
+	srcChain := uint64(e.chainID)
+	dstChain := uint64(1) // Cosmos or target chain
 
-	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
-		SrcChain:        srcChain,
-		DstChain:        dstChain,
-		SrcTokenAddress: req.SourceToken,
-		DstTokenAddress: req.DestToken,
-		Amount:          intervalAmount.String(),
-		WalletAddress:   req.UserAddress,
-		EnableEstimate:  true,
-	}
-
-	return e.fusionPlusClient.GetQuote(ctx, quoteParams)
+	return e.oneInchClient.GetFusionQuote(
+		ctx,
+		srcChain,
+		dstChain,
+		req.SourceToken,
+		req.DestToken,
+		intervalAmount.String(),
+		req.UserAddress,
+	)
 }
 
 func (e *ProductionTWAPEngine) createTWAPOrder(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int) (*TWAPOrder, error) {
@@ -772,28 +637,76 @@ func (e *ProductionTWAPEngine) executeWindow(ctx context.Context, order *TWAPOrd
 }
 
 func (e *ProductionTWAPEngine) executeFusionPlusWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
-	// Implementation for Fusion+ execution
-	// This would create a Fusion+ order for the window amount
-	e.logger.Info("Executing via Fusion+",
+	// Implementation for Fusion+ execution using HTTP API
+	e.logger.Info("Executing via Fusion+ HTTP API",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
 	)
 	
-	// Create Fusion+ order parameters similar to the example
-	// This is where you'd integrate with the actual Fusion+ SDK
+	// Get Fusion+ quote
+	srcChain := uint64(e.chainID)
+	dstChain := uint64(1) // Target chain
+	
+	quote, err := e.oneInchClient.GetFusionQuote(
+		ctx,
+		srcChain,
+		dstChain,
+		order.SourceToken,
+		order.DestToken,
+		window.Amount.String(),
+		order.UserAddress,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get Fusion+ quote: %w", err)
+	}
+
+	// Create and place Fusion+ order
+	orderHash, err := e.generateOrderHash()
+	if err != nil {
+		return fmt.Errorf("failed to generate order hash: %w", err)
+	}
+
+	fusionOrderReq := oneinch.FusionOrderRequest{
+		WalletAddress: order.UserAddress,
+		OrderHash:     orderHash,
+		SecretHashes:  []string{window.SecretHash},
+		Receiver:      order.UserAddress,
+		Preset:        quote.RecommendedPreset,
+	}
+
+	fusionOrderResp, err := e.oneInchClient.PlaceFusionOrder(ctx, fusionOrderReq)
+	if err != nil {
+		return fmt.Errorf("failed to place Fusion+ order: %w", err)
+	}
+
+	if !fusionOrderResp.Success {
+		return fmt.Errorf("fusion+ order placement failed: %s", fusionOrderResp.Message)
+	}
+
+	window.FusionPlusHash = fusionOrderResp.OrderHash
+
+	// Track the order
+	fusionRef := &FusionPlusOrderRef{
+		OrderHash:       fusionOrderResp.OrderHash,
+		WindowIndex:     window.Index,
+		Amount:          window.Amount,
+		Status:          "pending",
+		SecretSubmitted: false,
+	}
+	order.FusionPlusOrders = append(order.FusionPlusOrders, fusionRef)
+
 	return nil
 }
 
 func (e *ProductionTWAPEngine) executeOrderbookWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
-	// Implementation for Orderbook execution
-	// This would create a limit order for the window amount
-	e.logger.Info("Executing via Orderbook",
+	// Implementation for Orderbook execution using HTTP API
+	e.logger.Info("Executing via Orderbook HTTP API",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
 	)
 	
-	// Create orderbook order similar to the example
-	// This is where you'd integrate with the actual Orderbook SDK
+	// This would require implementing orderbook order creation
+	// For now, return success as placeholder
 	return nil
 }
 
@@ -805,12 +718,18 @@ func (e *ProductionTWAPEngine) shouldUseFusionPlus(order *TWAPOrder, window *Exe
 }
 
 func (e *ProductionTWAPEngine) generateSecret() (string, error) {
-	return fusionplus.GetRandomBytes32()
+	// Implement random secret generation
+	return e.oneInchClient.GenerateRandomBytes32()
 }
 
 func (e *ProductionTWAPEngine) hashSecret(secret string) string {
-	hash, _ := fusionplus.HashSecret(secret)
+	hash, _ := e.oneInchClient.HashSecret(secret)
 	return hash
+}
+
+func (e *ProductionTWAPEngine) generateOrderHash() (string, error) {
+	// Generate a unique order hash
+	return fmt.Sprintf("0x%x", time.Now().UnixNano()), nil
 }
 
 func (e *ProductionTWAPEngine) calculatePriceImpact(inputAmount, outputAmount *big.Int) float64 {

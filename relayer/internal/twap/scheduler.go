@@ -1,23 +1,20 @@
+
 package twap
 
 import (
 	"context"
 	"fmt"
 	"math/big"
-	"reflect"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"go.uber.org/zap"
 
-	"github.com/1inch/1inch-sdk-go/sdk-clients/fusionplus"
-	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
-	
 	"flow-fusion/relayer/internal/cosmos"
+	"flow-fusion/relayer/internal/oneinch"
 )
 
-// TWAPScheduler manages the scheduling and execution of TWAP orders using 1inch protocols
+// TWAPScheduler manages the scheduling and execution of TWAP orders using 1inch HTTP API
 type TWAPScheduler struct {
 	engine              *ProductionTWAPEngine
 	logger              *zap.Logger
@@ -58,7 +55,7 @@ func NewTWAPScheduler(logger *zap.Logger, engine *ProductionTWAPEngine) *TWAPSch
 }
 
 func (s *TWAPScheduler) Start(ctx context.Context) {
-	s.logger.Info("Starting Production TWAP Scheduler",
+	s.logger.Info("Starting Production TWAP Scheduler with HTTP API",
 		zap.Int("max_concurrent", s.maxConcurrentOrders),
 	)
 
@@ -233,83 +230,89 @@ func (s *TWAPScheduler) executeTask(ctx context.Context, task *ExecutionTask, wo
 }
 
 func (s *TWAPScheduler) executeFusionPlusWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
-	s.logger.Info("Executing window via Fusion+",
+	s.logger.Info("Executing window via Fusion+ HTTP API",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
 	)
 
-	srcChain := float32(s.engine.chainID)
-	dstChain := float32(1)
+	srcChain := uint64(s.engine.chainID)
+	dstChain := uint64(1) // Target chain
 
-	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
-		SrcChain:        srcChain,
-		DstChain:        dstChain,
-		SrcTokenAddress: order.SourceToken,
-		DstTokenAddress: order.DestToken,
-		Amount:          window.Amount.String(),
-		WalletAddress:   order.UserAddress,
-		EnableEstimate:  true,
-	}
-
-	quote, err := s.engine.fusionPlusClient.GetQuote(ctx, quoteParams)
+	// Get Fusion+ quote using HTTP API
+	quote, err := s.engine.oneInchClient.GetFusionQuote(
+		ctx,
+		srcChain,
+		dstChain,
+		order.SourceToken,
+		order.DestToken,
+		window.Amount.String(),
+		order.UserAddress,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to get Fusion+ quote: %w", err)
 	}
 
-	// Get preset and generate secrets
-	preset, err := fusionplus.GetPreset(quote.Presets, quote.RecommendedPreset)
-	if err != nil {
-		return fmt.Errorf("failed to get preset: %w", err)
+	// Find the recommended preset
+	var selectedPreset *oneinch.FusionPreset
+	for _, preset := range quote.Presets {
+		if preset.Name == quote.RecommendedPreset {
+			selectedPreset = &preset
+			break
+		}
+	}
+	if selectedPreset == nil {
+		return fmt.Errorf("recommended preset not found: %s", quote.RecommendedPreset)
 	}
 
-	secretsCount := int(preset.SecretsCount)
+	// Generate secrets based on preset requirements
+	secretsCount := selectedPreset.SecretsCount
 	secrets := make([]string, secretsCount)
 	secretHashes := make([]string, secretsCount)
 
 	for i := 0; i < secretsCount; i++ {
-		secret, err := fusionplus.GetRandomBytes32()
+		secret, err := s.generateSecret()
 		if err != nil {
-			return fmt.Errorf("failed to generate secret: %w", err)
+			return fmt.Errorf("failed to generate secret %d: %w", i, err)
 		}
 		secrets[i] = secret
 
-		secretHash, err := fusionplus.HashSecret(secret)
+		secretHash, err := s.hashSecret(secret)
 		if err != nil {
-			return fmt.Errorf("failed to hash secret: %w", err)
+			return fmt.Errorf("failed to hash secret %d: %w", i, err)
 		}
 		secretHashes[i] = secretHash
 	}
 
-	// Create hash lock
-	var hashLock *fusionplus.HashLock
-	if secretsCount == 1 {
-		hashLock, err = fusionplus.ForSingleFill(secrets[0])
-	} else {
-		hashLock, err = fusionplus.ForMultipleFills(secrets)
-	}
+	// Generate order hash
+	orderHash, err := s.generateOrderHash(quote, secretHashes, order.UserAddress)
 	if err != nil {
-		return fmt.Errorf("failed to create hash lock: %w", err)
+		return fmt.Errorf("failed to generate order hash: %w", err)
 	}
 
-	// Place Fusion+ order
-	orderParams := fusionplus.OrderParams{
-		HashLock:     hashLock,
-		SecretHashes: secretHashes,
-		Receiver:     order.UserAddress,
-		Preset:       quote.RecommendedPreset,
+	// Place Fusion+ order using HTTP API
+	fusionOrderReq := oneinch.FusionOrderRequest{
+		WalletAddress: order.UserAddress,
+		OrderHash:     orderHash,
+		SecretHashes:  secretHashes,
+		Receiver:      order.UserAddress,
+		Preset:        quote.RecommendedPreset,
 	}
 
-	orderHash, err := s.engine.fusionPlusClient.PlaceOrder(ctx, quoteParams, quote, orderParams, s.engine.fusionPlusClient.Wallet)
+	fusionOrderResp, err := s.engine.oneInchClient.PlaceFusionOrder(ctx, fusionOrderReq)
 	if err != nil {
 		return fmt.Errorf("failed to place Fusion+ order: %w", err)
 	}
 
-	window.FusionPlusHash = orderHash
+	if !fusionOrderResp.Success {
+		return fmt.Errorf("fusion+ order placement failed: %s", fusionOrderResp.Message)
+	}
+
+	window.FusionPlusHash = fusionOrderResp.OrderHash
 	window.Secret = secrets[0] 
 	window.SecretHash = secretHashes[0]
 
 	fusionOrderRef := &FusionPlusOrderRef{
-		OrderHash:       orderHash,
+		OrderHash:       fusionOrderResp.OrderHash,
 		WindowIndex:     window.Index,
 		Amount:          window.Amount,
 		Status:          "pending",
@@ -320,141 +323,51 @@ func (s *TWAPScheduler) executeFusionPlusWindow(ctx context.Context, order *TWAP
 	// Monitor and submit secret when ready
 	go s.monitorFusionPlusOrder(ctx, order, window, fusionOrderRef, secrets[0])
 
-	s.logger.Info("Fusion+ order placed",
+	s.logger.Info("Fusion+ order placed via HTTP API",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
-		zap.String("fusion_hash", orderHash),
+		zap.String("fusion_hash", fusionOrderResp.OrderHash),
 	)
 
 	return nil
 }
 
-// Helper function to safely extract string value from a struct field using reflection
-func getStringFieldValue(obj interface{}, fieldNames ...string) string {
-	if obj == nil {
-		return ""
-	}
-	
-	v := reflect.ValueOf(obj)
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return ""
-		}
-		v = v.Elem()
-	}
-	
-	if v.Kind() != reflect.Struct {
-		return ""
-	}
-	
-	for _, fieldName := range fieldNames {
-		field := v.FieldByName(fieldName)
-		if field.IsValid() && field.Kind() == reflect.String {
-			return field.String()
-		}
-	}
-	
-	return ""
-}
-
-// Helper function to safely extract order hash from CreateOrderResponse
-func extractOrderHash(response *orderbook.CreateOrderResponse) (string, error) {
-	if response == nil {
-		return "", fmt.Errorf("create order response is nil")
-	}
-
-	// Try to extract hash using reflection to handle different possible field names
-	orderHash := getStringFieldValue(response, "Hash", "OrderHash", "ID")
-	
-	if orderHash == "" {
-		// Try to get hash from nested Order field if it exists
-		v := reflect.ValueOf(response).Elem()
-		orderField := v.FieldByName("Order")
-		if orderField.IsValid() && !orderField.IsNil() {
-			orderHash = getStringFieldValue(orderField.Interface(), "Hash", "OrderHash", "ID")
-		}
-	}
-	
-	if orderHash == "" {
-		return "", fmt.Errorf("could not extract order hash from response - available fields: %+v", response)
-	}
-	
-	return orderHash, nil
-}
-
 func (s *TWAPScheduler) executeOrderbookWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
-	s.logger.Info("Executing window via Orderbook",
+	s.logger.Info("Executing window via Orderbook HTTP API",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
 	)
 
-	// Get series nonce for orderbook
-	userAddress := common.HexToAddress(order.UserAddress)
-	seriesNonce, err := s.engine.orderbookClient.GetSeriesNonce(ctx, userAddress)
-	if err != nil {
-		return fmt.Errorf("failed to get series nonce: %w", err)
-	}
-
-	// Create maker traits for the order
-	expireAfter := time.Now().Add(time.Hour).Unix()
-	makerTraits, err := orderbook.NewMakerTraits(orderbook.MakerTraitsParams{
-		AllowedSender:      "0x0000000000000000000000000000000000000000",
-		ShouldCheckEpoch:   false,
-		UsePermit2:         false,
-		UnwrapWeth:         false,
-		HasExtension:       false,
-		Expiry:             expireAfter,
-		Nonce:              seriesNonce.Int64(),
-		Series:             0,
-		AllowMultipleFills: true,
-		AllowPartialFills:  true,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create maker traits: %w", err)
-	}
-
 	// Calculate taking amount based on expected output
 	takingAmount := s.calculateExpectedOutput(window.Amount, order.SourceToken, order.DestToken)
 
-	// Create orderbook order
-	createOrderResponse, err := s.engine.orderbookClient.CreateOrder(ctx, orderbook.CreateOrderParams{
-		Wallet:                         s.engine.orderbookClient.Wallet,
-		SeriesNonce:                    seriesNonce,
-		ExpireAfterUnix:                expireAfter,
-		Maker:                          order.UserAddress,
-		MakerAsset:                     order.SourceToken,
-		TakerAsset:                     order.DestToken,
-		MakingAmount:                   window.Amount.String(),
-		TakingAmount:                   takingAmount.String(),
-		Taker:                          "0x0000000000000000000000000000000000000000",
-		SkipWarnings:                   false,
-		EnableOnchainApprovalsIfNeeded: false,
-		MakerTraits:                    makerTraits,
-	})
+	// Create orderbook order using HTTP API
+	orderbookOrderReq := oneinch.OrderbookOrderRequest{
+		Maker:        order.UserAddress,
+		MakerAsset:   order.SourceToken,
+		TakerAsset:   order.DestToken,
+		MakingAmount: window.Amount.String(),
+		TakingAmount: takingAmount.String(),
+		Salt:         fmt.Sprintf("%d", time.Now().UnixNano()),
+		MakerTraits:  "0", // Default traits
+		Signature:    "0x", // Would need proper signature
+	}
+
+	orderbookOrderResp, err := s.engine.oneInchClient.CreateOrderbookOrder(ctx, orderbookOrderReq)
 	if err != nil {
 		return fmt.Errorf("failed to create orderbook order: %w", err)
 	}
 
-	if !createOrderResponse.Success {
-		return fmt.Errorf("orderbook order creation failed: %v", createOrderResponse)
-	}
-
-	// Extract order hash using the helper function
-	orderHash, err := extractOrderHash(createOrderResponse)
-	if err != nil {
-		s.logger.Error("Could not extract order hash from response",
-			zap.Any("response", createOrderResponse),
-			zap.Error(err),
-		)
-		return err
+	if !orderbookOrderResp.Success {
+		return fmt.Errorf("orderbook order creation failed: %s", orderbookOrderResp.Message)
 	}
 
 	// Update window with orderbook order details
-	window.OrderbookHash = orderHash
+	window.OrderbookHash = orderbookOrderResp.OrderHash
 
 	// Add to order's orderbook orders tracking
 	orderbookOrderRef := &OrderbookOrderRef{
-		OrderHash:   orderHash,
+		OrderHash:   orderbookOrderResp.OrderHash,
 		WindowIndex: window.Index,
 		Amount:      window.Amount,
 		Status:      "pending",
@@ -465,35 +378,13 @@ func (s *TWAPScheduler) executeOrderbookWindow(ctx context.Context, order *TWAPO
 	// Monitor orderbook order status
 	go s.monitorOrderbookOrder(ctx, order, window, orderbookOrderRef)
 
-	s.logger.Info("Orderbook order created",
+	s.logger.Info("Orderbook order created via HTTP API",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
-		zap.String("orderbook_hash", orderHash),
+		zap.String("orderbook_hash", orderbookOrderResp.OrderHash),
 	)
 
 	return nil
-}
-
-// Helper function to safely extract order status and filled amount from OrderResponse struct
-func extractOrderInfo(order *orderbook.OrderResponse) (status string, filledAmount *big.Int) {
-	if order == nil {
-		return "", big.NewInt(0)
-	}
-	
-	// Try to extract status using reflection
-	status = getStringFieldValue(order, "Status", "State", "OrderStatus")
-	
-	// Try to extract filled amount using reflection
-	filledAmountStr := getStringFieldValue(order, "FilledMakingAmount", "FilledAmount", "Filled", "FilledQty")
-	
-	filledAmount = big.NewInt(0)
-	if filledAmountStr != "" {
-		if parsed, ok := new(big.Int).SetString(filledAmountStr, 10); ok {
-			filledAmount = parsed
-		}
-	}
-	
-	return status, filledAmount
 }
 
 func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPOrder, window *ExecutionWindow, fusionRef *FusionPlusOrderRef, secret string) {
@@ -513,10 +404,8 @@ func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPO
 			)
 			return
 		case <-ticker.C:
-			// Check order status
-			fusionOrder, err := s.engine.fusionPlusClient.GetOrderByOrderHash(ctx, fusionplus.GetOrderByOrderHashParams{
-				Hash: fusionRef.OrderHash,
-			})
+			// Check order status using HTTP API
+			fusionOrder, err := s.engine.oneInchClient.GetFusionOrderStatus(ctx, fusionRef.OrderHash)
 			if err != nil {
 				s.logger.Error("Failed to get Fusion+ order status",
 					zap.String("fusion_hash", fusionRef.OrderHash),
@@ -525,12 +414,10 @@ func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPO
 				continue
 			}
 
-			fusionRef.Status = string(fusionOrder.Status)
+			fusionRef.Status = fusionOrder.Status
 
-			// Check for ready fills
-			fills, err := s.engine.fusionPlusClient.GetReadyToAcceptFills(ctx, fusionplus.GetOrderByOrderHashParams{
-				Hash: fusionRef.OrderHash,
-			})
+			// Check for ready fills using HTTP API
+			fills, err := s.engine.oneInchClient.GetReadyToAcceptFills(ctx, fusionRef.OrderHash)
 			if err != nil {
 				s.logger.Error("Failed to get ready fills",
 					zap.String("fusion_hash", fusionRef.OrderHash),
@@ -541,10 +428,7 @@ func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPO
 
 			// Submit secret if fills are ready and not already submitted
 			if len(fills.Fills) > 0 && !fusionRef.SecretSubmitted {
-				err = s.engine.fusionPlusClient.SubmitSecret(ctx, fusionplus.SecretInput{
-					OrderHash: fusionRef.OrderHash,
-					Secret:    secret,
-				})
+				secretResp, err := s.engine.oneInchClient.SubmitSecret(ctx, fusionRef.OrderHash, secret)
 				if err != nil {
 					s.logger.Error("Failed to submit secret",
 						zap.String("fusion_hash", fusionRef.OrderHash),
@@ -553,8 +437,16 @@ func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPO
 					continue
 				}
 
+				if !secretResp.Success {
+					s.logger.Error("Secret submission failed",
+						zap.String("fusion_hash", fusionRef.OrderHash),
+						zap.String("message", secretResp.Message),
+					)
+					continue
+				}
+
 				fusionRef.SecretSubmitted = true
-				s.logger.Info("Secret submitted for Fusion+ order",
+				s.logger.Info("Secret submitted for Fusion+ order via HTTP API",
 					zap.String("order_id", order.ID),
 					zap.String("fusion_hash", fusionRef.OrderHash),
 				)
@@ -569,7 +461,7 @@ func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPO
 			}
 
 			// Check if order is executed
-			if string(fusionOrder.Status) == "executed" {
+			if fusionOrder.Status == "executed" {
 				window.Status = WindowStatusCompleted
 				s.engine.ordersMutex.Lock()
 				order.CompletedWindows++
@@ -603,10 +495,8 @@ func (s *TWAPScheduler) monitorOrderbookOrder(ctx context.Context, order *TWAPOr
 			)
 			return
 		case <-ticker.C:
-			// Check order status by fetching orders for the user
-			orders, err := s.engine.orderbookClient.GetOrdersByCreatorAddress(ctx, orderbook.GetOrdersByCreatorAddressParams{
-				CreatorAddress: order.UserAddress,
-			})
+			// Check order status by fetching orders for the user using HTTP API
+			orders, err := s.engine.oneInchClient.GetOrderbookOrdersByMaker(ctx, order.UserAddress, 100)
 			if err != nil {
 				s.logger.Error("Failed to get orderbook orders",
 					zap.String("orderbook_hash", orderbookRef.OrderHash),
@@ -616,33 +506,27 @@ func (s *TWAPScheduler) monitorOrderbookOrder(ctx context.Context, order *TWAPOr
 			}
 
 			// Find our specific order
-			var foundOrder *orderbook.OrderResponse
+			var foundOrder *oneinch.OrderbookOrder
 			for i := range orders {
-				ord := orders[i] // Remove & since orders[i] is already *orderbook.OrderResponse
-				// Try different possible hash fields using reflection
-				orderHash := getStringFieldValue(ord, "OrderHash", "Hash", "ID")
-				
-				if orderHash == orderbookRef.OrderHash {
-					foundOrder = ord
+				if orders[i].OrderHash == orderbookRef.OrderHash {
+					foundOrder = &orders[i]
 					break
 				}
 			}
 
 			if foundOrder != nil {
-				// Extract status and filled amount safely
-				status, filledAmount := extractOrderInfo(foundOrder)
+				orderbookRef.Status = foundOrder.Status
 				
-				if status != "" {
-					orderbookRef.Status = status
-				}
-				
-				if filledAmount != nil && filledAmount.Cmp(big.NewInt(0)) > 0 {
-					orderbookRef.Filled = filledAmount
+				if foundOrder.RemainingAmount != "" {
+					if remaining, ok := new(big.Int).SetString(foundOrder.RemainingAmount, 10); ok {
+						filled := new(big.Int).Sub(window.Amount, remaining)
+						orderbookRef.Filled = filled
+					}
 				}
 
 				// Check if order is fully filled
-				isCompleted := status == "filled" || 
-							   status == "completed" ||
+				isCompleted := foundOrder.Status == "filled" || 
+							   foundOrder.Status == "completed" ||
 							   (orderbookRef.Filled != nil && orderbookRef.Filled.Cmp(window.Amount) >= 0)
 
 				if isCompleted {
@@ -717,6 +601,28 @@ func (s *TWAPScheduler) shouldUseFusionPlus(order *TWAPOrder, window *ExecutionW
 	}
 	
 	return window.Amount.Cmp(threshold) > 0 || sourceChain != destChain
+}
+
+// Helper methods for crypto operations
+func (s *TWAPScheduler) generateSecret() (string, error) {
+	// Generate random secret - this needs to be implemented
+	return s.engine.oneInchClient.GenerateRandomBytes32()
+}
+
+func (s *TWAPScheduler) hashSecret(secret string) (string, error) {
+	// Hash the secret - this needs to be implemented
+	return s.engine.oneInchClient.HashSecret(secret)
+}
+
+func (s *TWAPScheduler) generateOrderHash(quote *oneinch.FusionQuoteResponse, secretHashes []string, userAddress string) (string, error) {
+	// Generate order hash based on order parameters
+	// This is a simplified implementation - real implementation would follow 1inch order structure
+	return fmt.Sprintf("0x%x", time.Now().UnixNano()), nil
+}
+
+func (s *TWAPScheduler) generateSimpleOrderHash() string {
+	// Generate a simple order hash
+	return fmt.Sprintf("0x%x", time.Now().UnixNano())
 }
 
 func (s *TWAPScheduler) shouldExecuteWindow(window *ExecutionWindow, now time.Time) bool {
