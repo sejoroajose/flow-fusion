@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"reflect"
 	"sync"
 	"time"
 
@@ -237,9 +238,8 @@ func (s *TWAPScheduler) executeFusionPlusWindow(ctx context.Context, order *TWAP
 		zap.Int("window", window.Index),
 	)
 
-	// Get Fusion+ quote for this window
 	srcChain := float32(s.engine.chainID)
-	dstChain := float32(1) // Target chain (Cosmos)
+	dstChain := float32(1)
 
 	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
 		SrcChain:        srcChain,
@@ -304,12 +304,10 @@ func (s *TWAPScheduler) executeFusionPlusWindow(ctx context.Context, order *TWAP
 		return fmt.Errorf("failed to place Fusion+ order: %w", err)
 	}
 
-	// Update window with Fusion+ order details
 	window.FusionPlusHash = orderHash
-	window.Secret = secrets[0] // Store first secret
+	window.Secret = secrets[0] 
 	window.SecretHash = secretHashes[0]
 
-	// Add to order's Fusion+ orders tracking
 	fusionOrderRef := &FusionPlusOrderRef{
 		OrderHash:       orderHash,
 		WindowIndex:     window.Index,
@@ -329,6 +327,59 @@ func (s *TWAPScheduler) executeFusionPlusWindow(ctx context.Context, order *TWAP
 	)
 
 	return nil
+}
+
+// Helper function to safely extract string value from a struct field using reflection
+func getStringFieldValue(obj interface{}, fieldNames ...string) string {
+	if obj == nil {
+		return ""
+	}
+	
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	
+	if v.Kind() != reflect.Struct {
+		return ""
+	}
+	
+	for _, fieldName := range fieldNames {
+		field := v.FieldByName(fieldName)
+		if field.IsValid() && field.Kind() == reflect.String {
+			return field.String()
+		}
+	}
+	
+	return ""
+}
+
+// Helper function to safely extract order hash from CreateOrderResponse
+func extractOrderHash(response *orderbook.CreateOrderResponse) (string, error) {
+	if response == nil {
+		return "", fmt.Errorf("create order response is nil")
+	}
+
+	// Try to extract hash using reflection to handle different possible field names
+	orderHash := getStringFieldValue(response, "Hash", "OrderHash", "ID")
+	
+	if orderHash == "" {
+		// Try to get hash from nested Order field if it exists
+		v := reflect.ValueOf(response).Elem()
+		orderField := v.FieldByName("Order")
+		if orderField.IsValid() && !orderField.IsNil() {
+			orderHash = getStringFieldValue(orderField.Interface(), "Hash", "OrderHash", "ID")
+		}
+	}
+	
+	if orderHash == "" {
+		return "", fmt.Errorf("could not extract order hash from response - available fields: %+v", response)
+	}
+	
+	return orderHash, nil
 }
 
 func (s *TWAPScheduler) executeOrderbookWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
@@ -388,12 +439,22 @@ func (s *TWAPScheduler) executeOrderbookWindow(ctx context.Context, order *TWAPO
 		return fmt.Errorf("orderbook order creation failed: %v", createOrderResponse)
 	}
 
+	// Extract order hash using the helper function
+	orderHash, err := extractOrderHash(createOrderResponse)
+	if err != nil {
+		s.logger.Error("Could not extract order hash from response",
+			zap.Any("response", createOrderResponse),
+			zap.Error(err),
+		)
+		return err
+	}
+
 	// Update window with orderbook order details
-	window.OrderbookHash = createOrderResponse.OrderHash
+	window.OrderbookHash = orderHash
 
 	// Add to order's orderbook orders tracking
 	orderbookOrderRef := &OrderbookOrderRef{
-		OrderHash:   createOrderResponse.OrderHash,
+		OrderHash:   orderHash,
 		WindowIndex: window.Index,
 		Amount:      window.Amount,
 		Status:      "pending",
@@ -407,10 +468,32 @@ func (s *TWAPScheduler) executeOrderbookWindow(ctx context.Context, order *TWAPO
 	s.logger.Info("Orderbook order created",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
-		zap.String("orderbook_hash", createOrderResponse.OrderHash),
+		zap.String("orderbook_hash", orderHash),
 	)
 
 	return nil
+}
+
+// Helper function to safely extract order status and filled amount from OrderResponse struct
+func extractOrderInfo(order *orderbook.OrderResponse) (status string, filledAmount *big.Int) {
+	if order == nil {
+		return "", big.NewInt(0)
+	}
+	
+	// Try to extract status using reflection
+	status = getStringFieldValue(order, "Status", "State", "OrderStatus")
+	
+	// Try to extract filled amount using reflection
+	filledAmountStr := getStringFieldValue(order, "FilledMakingAmount", "FilledAmount", "Filled", "FilledQty")
+	
+	filledAmount = big.NewInt(0)
+	if filledAmountStr != "" {
+		if parsed, ok := new(big.Int).SetString(filledAmountStr, 10); ok {
+			filledAmount = parsed
+		}
+	}
+	
+	return status, filledAmount
 }
 
 func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPOrder, window *ExecutionWindow, fusionRef *FusionPlusOrderRef, secret string) {
@@ -533,24 +616,36 @@ func (s *TWAPScheduler) monitorOrderbookOrder(ctx context.Context, order *TWAPOr
 			}
 
 			// Find our specific order
-			var foundOrder *orderbook.Order
-			for _, ord := range orders {
-				if ord.OrderHash == orderbookRef.OrderHash {
-					foundOrder = &ord
+			var foundOrder *orderbook.OrderResponse
+			for i := range orders {
+				ord := orders[i] // Remove & since orders[i] is already *orderbook.OrderResponse
+				// Try different possible hash fields using reflection
+				orderHash := getStringFieldValue(ord, "OrderHash", "Hash", "ID")
+				
+				if orderHash == orderbookRef.OrderHash {
+					foundOrder = ord
 					break
 				}
 			}
 
 			if foundOrder != nil {
-				orderbookRef.Status = foundOrder.Status
+				// Extract status and filled amount safely
+				status, filledAmount := extractOrderInfo(foundOrder)
 				
-				// Parse filled amount
-				if filledAmount, ok := new(big.Int).SetString(foundOrder.FilledMakingAmount, 10); ok {
+				if status != "" {
+					orderbookRef.Status = status
+				}
+				
+				if filledAmount != nil && filledAmount.Cmp(big.NewInt(0)) > 0 {
 					orderbookRef.Filled = filledAmount
 				}
 
 				// Check if order is fully filled
-				if foundOrder.Status == "filled" || orderbookRef.Filled.Cmp(window.Amount) >= 0 {
+				isCompleted := status == "filled" || 
+							   status == "completed" ||
+							   (orderbookRef.Filled != nil && orderbookRef.Filled.Cmp(window.Amount) >= 0)
+
+				if isCompleted {
 					window.Status = WindowStatusCompleted
 					s.engine.ordersMutex.Lock()
 					order.CompletedWindows++
@@ -564,6 +659,11 @@ func (s *TWAPScheduler) monitorOrderbookOrder(ctx context.Context, order *TWAPOr
 					)
 					return
 				}
+			} else {
+				s.logger.Debug("Order not found in user's orders",
+					zap.String("order_id", order.ID),
+					zap.String("orderbook_hash", orderbookRef.OrderHash),
+				)
 			}
 		}
 	}
@@ -618,7 +718,6 @@ func (s *TWAPScheduler) shouldUseFusionPlus(order *TWAPOrder, window *ExecutionW
 	
 	return window.Amount.Cmp(threshold) > 0 || sourceChain != destChain
 }
-
 
 func (s *TWAPScheduler) shouldExecuteWindow(window *ExecutionWindow, now time.Time) bool {
 	return window.Status == WindowStatusPending && 

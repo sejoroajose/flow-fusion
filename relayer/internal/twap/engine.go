@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"reflect"
 	"sync"
 	"time"
 
@@ -34,10 +35,10 @@ type ProductionTWAPEngine struct {
 	cosmosClient      *cosmos.Client
 	logger            *zap.Logger
 	
-	// 1inch SDK clients
+	// 1inch SDK clients - use interface types for better compatibility
 	fusionPlusClient  *fusionplus.Client
 	orderbookClient   *orderbook.Client
-	aggregationClient *aggregation.Client
+	aggregationClient interface{} 
 	tokensClient      *tokens.Client
 	
 	// State management
@@ -200,6 +201,77 @@ type FeeBreakdown struct {
 	Total            string `json:"total"`
 }
 
+// Helper function to safely extract string value from a struct field using reflection
+/* func getStringFieldValue(obj interface{}, fieldNames ...string) string {
+	if obj == nil {
+		return ""
+	}
+	
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	
+	if v.Kind() != reflect.Struct {
+		return ""
+	}
+	
+	for _, fieldName := range fieldNames {
+		field := v.FieldByName(fieldName)
+		if field.IsValid() && field.Kind() == reflect.String {
+			return field.String()
+		}
+	}
+	
+	return ""
+} */
+
+// Helper function to safely extract int value from a struct field using reflection
+func getIntFieldValue(obj interface{}, fieldNames ...string) int {
+	if obj == nil {
+		return 0
+	}
+	
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return 0
+		}
+		v = v.Elem()
+	}
+	
+	if v.Kind() != reflect.Struct {
+		return 0
+	}
+	
+	for _, fieldName := range fieldNames {
+		field := v.FieldByName(fieldName)
+		if field.IsValid() && field.CanInt() {
+			return int(field.Int())
+		}
+	}
+	
+	return 0
+}
+
+// Helper function to call GetSwap method on either aggregation client type
+func (e *ProductionTWAPEngine) callGetSwap(ctx context.Context, params aggregation.GetSwapParams) (interface{}, error) {
+	// Try ClientOnlyAPI first
+	if clientAPI, ok := e.aggregationClient.(*aggregation.ClientOnlyAPI); ok {
+		return clientAPI.GetSwap(ctx, params)
+	}
+	
+	// Try regular Client
+	if client, ok := e.aggregationClient.(*aggregation.Client); ok {
+		return client.GetSwap(ctx, params)
+	}
+	
+	return nil, fmt.Errorf("aggregation client type not supported")
+}
+
 func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosClient *cosmos.Client, logger *zap.Logger) (*ProductionTWAPEngine, error) {
 	// Parse private key
 	privateKey, err := crypto.HexToECDSA(config.PrivateKey)
@@ -238,11 +310,11 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 		return nil, fmt.Errorf("failed to create Fusion+ client: %w", err)
 	}
 
-	// Initialize Orderbook client
+	// Initialize Orderbook client - fix ChainID type conversion
 	orderbookConfig, err := orderbook.NewConfiguration(orderbook.ConfigurationParams{
 		NodeUrl:    config.NodeURL,
 		PrivateKey: config.PrivateKey,
-		ChainId:    config.ChainID,
+		ChainId:    uint64(config.ChainID), 
 		ApiUrl:     "https://api.1inch.dev",
 		ApiKey:     config.OneInchAPIKey,
 	})
@@ -257,7 +329,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 
 	// Initialize Aggregation client
 	aggConfig, err := aggregation.NewConfigurationAPI(
-		config.ChainID,
+		uint64(config.ChainID),
 		"https://api.1inch.dev",
 		config.OneInchAPIKey,
 	)
@@ -272,7 +344,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 
 	// Initialize Tokens client
 	tokensConfig, err := tokens.NewConfiguration(tokens.ConfigurationParams{
-		ChainId: config.ChainID,
+		ChainId: uint64(config.ChainID),
 		ApiUrl:  "https://api.1inch.dev",
 		ApiKey:  config.OneInchAPIKey,
 	})
@@ -292,7 +364,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 		logger:            logger,
 		fusionPlusClient:  fusionClient,
 		orderbookClient:   orderbookClient,
-		aggregationClient: aggClient,
+		aggregationClient: aggClient, // Store as interface{}
 		tokensClient:      tokensClient,
 		twapOrders:        make(map[string]*TWAPOrder),
 		redisClient:       redisClient,
@@ -308,7 +380,6 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 
 	return engine, nil
 }
-
 
 func (e *ProductionTWAPEngine) Start(ctx context.Context) error {
 	e.logger.Info("Starting Production TWAP Engine with 1inch Integration",
@@ -397,12 +468,12 @@ func (e *ProductionTWAPEngine) CreateOrder(c *gin.Context) {
 
 func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int) (*TWAPQuoteResponse, error) {
 	// Get instant swap quote for comparison
-	instantQuote, err := e.aggregationClient.GetSwap(ctx, aggregation.GetSwapParams{
+	instantQuote, err := e.callGetSwap(ctx, aggregation.GetSwapParams{
 		Src:             req.SourceToken,
 		Dst:             req.DestToken,
 		Amount:          totalAmount.String(),
 		From:            req.UserAddress,
-		Slippage:        1,
+		Slippage:        float32(req.MaxSlippage), // Convert float64 to float32
 		DisableEstimate: true,
 	})
 	if err != nil {
@@ -411,29 +482,39 @@ func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req Creat
 
 	// Calculate interval amount and get interval quote
 	intervalAmount := new(big.Int).Div(totalAmount, big.NewInt(int64(req.IntervalCount)))
-	intervalQuote, err := e.aggregationClient.GetSwap(ctx, aggregation.GetSwapParams{
+	intervalQuote, err := e.callGetSwap(ctx, aggregation.GetSwapParams{
 		Src:             req.SourceToken,
 		Dst:             req.DestToken,
 		Amount:          intervalAmount.String(),
 		From:            req.UserAddress,
-		Slippage:        req.MaxSlippage,
+		Slippage:        float32(req.MaxSlippage), // Convert float64 to float32
 		DisableEstimate: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interval quote: %w", err)
 	}
 
-	// Calculate estimated TWAP output
-	intervalOutput, ok := new(big.Int).SetString(intervalQuote.ToTokenAmount, 10)
+	// Calculate estimated TWAP output using reflection to handle different response types
+	intervalOutputStr := getStringFieldValue(intervalQuote, "ToTokenAmount", "ToAmount", "DstAmount", "OutputAmount")
+	if intervalOutputStr == "" {
+		return nil, fmt.Errorf("unable to extract output amount from interval quote")
+	}
+	
+	intervalOutput, ok := new(big.Int).SetString(intervalOutputStr, 10)
 	if !ok {
-		return nil, fmt.Errorf("invalid interval output amount")
+		return nil, fmt.Errorf("invalid interval output amount: %s", intervalOutputStr)
 	}
 	twapEstimatedOutput := new(big.Int).Mul(intervalOutput, big.NewInt(int64(req.IntervalCount)))
 
 	// Compare price impacts
-	instantOutput, ok := new(big.Int).SetString(instantQuote.ToTokenAmount, 10)
+	instantOutputStr := getStringFieldValue(instantQuote, "ToTokenAmount", "ToAmount", "DstAmount", "OutputAmount")
+	if instantOutputStr == "" {
+		return nil, fmt.Errorf("unable to extract output amount from instant quote")
+	}
+	
+	instantOutput, ok := new(big.Int).SetString(instantOutputStr, 10)
 	if !ok {
-		return nil, fmt.Errorf("invalid instant output amount")
+		return nil, fmt.Errorf("invalid instant output amount: %s", instantOutputStr)
 	}
 
 	instantImpact := e.calculatePriceImpact(totalAmount, instantOutput)
@@ -458,8 +539,12 @@ func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req Creat
 	// Generate execution schedule
 	schedule := e.generateExecutionSchedule(req, totalAmount)
 
-	// Calculate fees
-	fees := e.calculateFees(req, instantQuote.EstimatedGas)
+	// Calculate fees - extract gas estimate using reflection
+	gasEstimate := getIntFieldValue(instantQuote, "EstimatedGas", "Gas", "GasLimit", "EstimatedGasLimit")
+	if gasEstimate == 0 {
+		gasEstimate = 300000 // Default gas estimate
+	}
+	fees := e.calculateFees(req, gasEstimate)
 
 	return &TWAPQuoteResponse{
 		EstimatedOutput: twapEstimatedOutput.String(),

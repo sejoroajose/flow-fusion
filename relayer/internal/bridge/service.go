@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 
@@ -33,11 +34,11 @@ type FusionBridgeService struct {
 	cosmosClient     *cosmos.Client
 	logger           *zap.Logger
 	
-	// 1inch SDK clients
-	fusionPlusClient *fusionplus.Client
-	orderbookClient  *orderbook.Client
-	aggregationClient *aggregation.Client
-	tokensClient     *tokens.Client
+	// 1inch SDK clients - use interface{} for compatibility
+	fusionPlusClient  *fusionplus.Client
+	orderbookClient   *orderbook.Client
+	aggregationClient interface{} // Can be either *aggregation.Client or *aggregation.ClientOnlyAPI
+	tokensClient      *tokens.Client
 	
 	// State management
 	bridgeOrders     map[string]*BridgeOrder
@@ -77,12 +78,12 @@ type BridgeOrder struct {
 	Status              BridgeOrderStatus      `json:"status"`
 	CreatedAt           time.Time              `json:"created_at"`
 	
-	// 1inch Fusion+ specific fields
+	// 1inch Fusion+ specific fields - use interface{} for flexibility
 	OneInchOrderHash    string                 `json:"oneinch_order_hash"`
 	Secrets             []string               `json:"-"` // Never expose secrets
 	SecretHashes        []string               `json:"secret_hashes"`
 	HashLock            *fusionplus.HashLock   `json:"-"`
-	FusionPlusOrder     *fusionplus.Order      `json:"fusion_plus_order,omitempty"`
+	FusionPlusOrder     interface{}            `json:"fusion_plus_order,omitempty"` // Changed to interface{}
 	
 	// Cross-chain tracking
 	EthereumTxHash      string                 `json:"ethereum_tx_hash,omitempty"`
@@ -149,6 +150,34 @@ type BridgeQuoteResponse struct {
 	QuoteData       interface{}   `json:"quote_data"` // Raw 1inch quote data
 }
 
+// Helper function to safely extract string value from any struct using reflection
+func getStringFieldValue(obj interface{}, fieldNames ...string) string {
+	if obj == nil {
+		return ""
+	}
+	
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	
+	if v.Kind() != reflect.Struct {
+		return ""
+	}
+	
+	for _, fieldName := range fieldNames {
+		field := v.FieldByName(fieldName)
+		if field.IsValid() && field.Kind() == reflect.String {
+			return field.String()
+		}
+	}
+	
+	return ""
+}
+
 func NewFusionBridgeService(config Config) (*FusionBridgeService, error) {
 	// Parse private key
 	privateKey, err := crypto.HexToECDSA(config.PrivateKey)
@@ -178,7 +207,7 @@ func NewFusionBridgeService(config Config) (*FusionBridgeService, error) {
 	orderbookConfig, err := orderbook.NewConfiguration(orderbook.ConfigurationParams{
 		NodeUrl:    config.NodeURL,
 		PrivateKey: config.PrivateKey,
-		ChainId:    config.ChainID,
+		ChainId:    uint64(config.ChainID),
 		ApiUrl:     "https://api.1inch.dev",
 		ApiKey:     config.OneInchAPIKey,
 	})
@@ -191,9 +220,8 @@ func NewFusionBridgeService(config Config) (*FusionBridgeService, error) {
 		return nil, fmt.Errorf("failed to create orderbook client: %w", err)
 	}
 
-	// Initialize aggregation client
 	aggConfig, err := aggregation.NewConfigurationAPI(
-		config.ChainID,
+		uint64(config.ChainID), 
 		"https://api.1inch.dev",
 		config.OneInchAPIKey,
 	)
@@ -206,9 +234,8 @@ func NewFusionBridgeService(config Config) (*FusionBridgeService, error) {
 		return nil, fmt.Errorf("failed to create aggregation client: %w", err)
 	}
 
-	// Initialize tokens client
 	tokensConfig, err := tokens.NewConfiguration(tokens.ConfigurationParams{
-		ChainId: config.ChainID,
+		ChainId: uint64(config.ChainID), 
 		ApiUrl:  "https://api.1inch.dev",
 		ApiKey:  config.OneInchAPIKey,
 	})
@@ -234,7 +261,7 @@ func NewFusionBridgeService(config Config) (*FusionBridgeService, error) {
 		logger:            config.Logger,
 		fusionPlusClient:  fusionClient,
 		orderbookClient:   orderbookClient,
-		aggregationClient: aggClient,
+		aggregationClient: aggClient, // Store as interface{}
 		tokensClient:      tokensClient,
 		bridgeOrders:      make(map[string]*BridgeOrder),
 		wsUpgrader:        wsUpgrader,
@@ -494,8 +521,8 @@ func (s *FusionBridgeService) processFusionPlusOrders(ctx context.Context) {
 }
 
 func (s *FusionBridgeService) processFusionPlusOrder(ctx context.Context, order *BridgeOrder) {
-	// Check order status in 1inch
-	fusionOrder, err := s.fusionPlusClient.GetOrderByOrderHash(ctx, fusionplus.GetOrderByOrderHashParams{
+	// Check order status in 1inch - this returns *fusionplus.GetOrderFillsByHashOutputFixed
+	fusionOrderData, err := s.fusionPlusClient.GetOrderByOrderHash(ctx, fusionplus.GetOrderByOrderHashParams{
 		Hash: order.OneInchOrderHash,
 	})
 	if err != nil {
@@ -507,10 +534,14 @@ func (s *FusionBridgeService) processFusionPlusOrder(ctx context.Context, order 
 		return
 	}
 
-	order.FusionPlusOrder = fusionOrder
+	// Store the actual returned data as interface{}
+	order.FusionPlusOrder = fusionOrderData
 
+	// Extract status using reflection to handle different fusion+ response types
+	status := getStringFieldValue(fusionOrderData, "Status", "OrderStatus", "State")
+	
 	// Update order status based on Fusion+ status
-	switch string(fusionOrder.Status) {
+	switch status {
 	case "pending":
 		if order.Status != BridgeOrderStatusPending {
 			order.Status = BridgeOrderStatusPending
@@ -531,6 +562,7 @@ func (s *FusionBridgeService) processFusionPlusOrder(ctx context.Context, order 
 			s.logger.Info("Fusion+ order completed",
 				zap.String("order_id", order.ID),
 				zap.String("oneinch_hash", order.OneInchOrderHash),
+				zap.String("fusion_status", status),
 			)
 		}
 	case "refunded":
@@ -547,8 +579,14 @@ func (s *FusionBridgeService) processFusionPlusOrder(ctx context.Context, order 
 			s.logger.Warn("Fusion+ order was refunded",
 				zap.String("order_id", order.ID),
 				zap.String("oneinch_hash", order.OneInchOrderHash),
+				zap.String("fusion_status", status),
 			)
 		}
+	default:
+		s.logger.Debug("Fusion+ order status",
+			zap.String("order_id", order.ID),
+			zap.String("status", status),
+		)
 	}
 
 	// Check for ready-to-accept fills
