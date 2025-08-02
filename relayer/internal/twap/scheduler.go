@@ -2,7 +2,6 @@ package twap
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/big"
 	"sync"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/1inch/1inch-sdk-go/sdk-clients/fusionplus"
 	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
+	
+	"flow-fusion/relayer/internal/cosmos"
 )
 
 // TWAPScheduler manages the scheduling and execution of TWAP orders using 1inch protocols
@@ -570,7 +571,7 @@ func (s *TWAPScheduler) monitorOrderbookOrder(ctx context.Context, order *TWAPOr
 
 func (s *TWAPScheduler) createCosmosEscrow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
 	// Create Cosmos escrow for cross-chain completion
-	params := s.engine.cosmosClient.CreateEscrowParams{
+	params := cosmos.CreateEscrowParams{
 		EthereumTxHash: window.FusionPlusHash,
 		SecretHash:     window.SecretHash,
 		TimeLock:       uint64(time.Now().Add(24 * time.Hour).Unix()),
@@ -604,9 +605,20 @@ func (s *TWAPScheduler) shouldUseFusionPlus(order *TWAPOrder, window *ExecutionW
 	// Decision logic for execution method
 	// Use Fusion+ for larger amounts or when cross-chain is involved
 	threshold := big.NewInt(1000000) // 1M units threshold
-	return window.Amount.Cmp(threshold) > 0 || 
-		   order.SourceChain != order.DestChain
+	
+	// Set defaults if chains are not specified
+	sourceChain := order.SourceChain
+	destChain := order.DestChain
+	if sourceChain == "" {
+		sourceChain = "ethereum"
+	}
+	if destChain == "" {
+		destChain = "cosmos"
+	}
+	
+	return window.Amount.Cmp(threshold) > 0 || sourceChain != destChain
 }
+
 
 func (s *TWAPScheduler) shouldExecuteWindow(window *ExecutionWindow, now time.Time) bool {
 	return window.Status == WindowStatusPending && 

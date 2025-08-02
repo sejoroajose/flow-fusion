@@ -180,7 +180,7 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 	// Metrics endpoint for monitoring
 	router.GET("/metrics", func(c *gin.Context) {
 		metrics := gin.H{
-			"bridge":    bridgeService.GetMetrics,
+			"bridge":    bridgeService.GetMetricsData(), 
 			"twap":      twapEngine.GetStatus(),
 			"ethereum":  bridgeService.GetEthereumStatusData(),
 			"cosmos":    bridgeService.GetCosmosStatusData(),
@@ -228,7 +228,7 @@ func setupProductionRouter(bridgeService *bridge.FusionBridgeService, twapEngine
 				"ethereum":  bridgeService.GetEthereumStatusData(),
 				"cosmos":    bridgeService.GetCosmosStatusData(),
 				"twap":      twapEngine.GetStatus(),
-				"bridge":    bridgeService.GetMetrics,
+				"bridge":    bridgeService.GetMetricsData(),  
 				"timestamp": time.Now().Unix(),
 				"uptime":    time.Since(startTime).String(),
 			}

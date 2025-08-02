@@ -874,3 +874,19 @@ func NewBridgeMetrics() *BridgeMetrics {
 		StartTime:   time.Now(),
 	}
 }
+
+func (s *FusionBridgeService) GetMetricsData() map[string]interface{} {
+	s.metrics.mutex.RLock()
+	defer s.metrics.mutex.RUnlock()
+	
+	return map[string]interface{}{
+		"total_orders":     s.metrics.TotalOrders,
+		"completed_orders": s.metrics.CompletedOrders,
+		"failed_orders":    s.metrics.FailedOrders,
+		"total_volume":     s.metrics.TotalVolume.String(),
+		"uptime":          time.Since(s.metrics.StartTime).String(),
+		"success_rate":    s.calculateSuccessRate(),
+		"public_address":  s.publicAddress.Hex(),
+		"chain_id":        s.config.ChainID,
+	}
+}

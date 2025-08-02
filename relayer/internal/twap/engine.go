@@ -24,12 +24,12 @@ import (
 
 	"flow-fusion/relayer/internal/cosmos"
 	"flow-fusion/relayer/internal/ethereum"
-	"flow-fusion/relayer/internal/config"
+	
 )
 
 // ProductionTWAPEngine implements TWAP execution using 1inch Fusion+ SDK
 type ProductionTWAPEngine struct {
-	config            *config.Config
+	config            Config
 	ethClient         *ethereum.Client
 	cosmosClient      *cosmos.Client
 	logger            *zap.Logger
@@ -74,6 +74,8 @@ type TWAPOrder struct {
 	UserAddress     string                `json:"user_address"`
 	SourceToken     string                `json:"source_token"`
 	DestToken       string                `json:"dest_token"`
+	SourceChain     string                `json:"source_chain"`     
+	DestChain       string                `json:"dest_chain"` 
 	TotalAmount     *big.Int              `json:"total_amount"`
 	IntervalCount   int                   `json:"interval_count"`
 	TimeWindow      int                   `json:"time_window"`
@@ -154,6 +156,8 @@ type CreateTWAPOrderRequest struct {
 	UserAddress   string  `json:"user_address" binding:"required"`
 	SourceToken   string  `json:"source_token" binding:"required"`
 	DestToken     string  `json:"dest_token" binding:"required"`
+	SourceChain   string  `json:"source_chain,omitempty"`      
+	DestChain     string  `json:"dest_chain,omitempty"`        
 	TotalAmount   string  `json:"total_amount" binding:"required"`
 	TimeWindow    int     `json:"time_window" binding:"required,min=300"`
 	IntervalCount int     `json:"interval_count" binding:"required,min=2,max=100"`
@@ -282,7 +286,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 	}
 
 	engine := &ProductionTWAPEngine{
-		config:            config,
+		config:            config,  
 		ethClient:         ethClient,
 		cosmosClient:      cosmosClient,
 		logger:            logger,
@@ -292,7 +296,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 		tokensClient:      tokensClient,
 		twapOrders:        make(map[string]*TWAPOrder),
 		redisClient:       redisClient,
-		rateLimiter:       rate.NewLimiter(rate.Limit(5), 10), // 5 requests per second
+		rateLimiter:       rate.NewLimiter(rate.Limit(5), 10), 
 		metrics:           NewTWAPMetrics(),
 		privateKey:        privateKey,
 		publicAddress:     publicAddress,
@@ -304,6 +308,7 @@ func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosCl
 
 	return engine, nil
 }
+
 
 func (e *ProductionTWAPEngine) Start(ctx context.Context) error {
 	e.logger.Info("Starting Production TWAP Engine with 1inch Integration",
@@ -494,10 +499,18 @@ func (e *ProductionTWAPEngine) createTWAPOrder(ctx context.Context, req CreateTW
 	
 	startTime := time.Now().Add(time.Duration(req.StartDelay) * time.Second)
 	if req.StartDelay == 0 {
-		startTime = startTime.Add(1 * time.Minute) // Default 1 minute delay
+		startTime = startTime.Add(1 * time.Minute) 
 	}
 
-	// Generate execution windows
+	sourceChain := req.SourceChain
+	destChain := req.DestChain
+	if sourceChain == "" {
+		sourceChain = "ethereum"
+	}
+	if destChain == "" {
+		destChain = "cosmos"
+	}
+
 	windows, err := e.generateExecutionWindows(ctx, req, totalAmount, startTime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate execution windows: %w", err)
@@ -508,6 +521,8 @@ func (e *ProductionTWAPEngine) createTWAPOrder(ctx context.Context, req CreateTW
 		UserAddress:      req.UserAddress,
 		SourceToken:      req.SourceToken,
 		DestToken:        req.DestToken,
+		SourceChain:      sourceChain,    
+		DestChain:        destChain,      
 		TotalAmount:      totalAmount,
 		IntervalCount:    req.IntervalCount,
 		TimeWindow:       req.TimeWindow,
@@ -538,6 +553,8 @@ func (e *ProductionTWAPEngine) createTWAPOrder(ctx context.Context, req CreateTW
 	e.logger.Info("TWAP order created",
 		zap.String("order_id", orderID),
 		zap.String("user", req.UserAddress),
+		zap.String("source_chain", sourceChain),
+		zap.String("dest_chain", destChain),
 		zap.Int("intervals", req.IntervalCount),
 		zap.String("total_amount", totalAmount.String()),
 		zap.Bool("fusion_plus", req.UseFusionPlus),
@@ -958,27 +975,6 @@ func (e *ProductionTWAPEngine) persistAllOrders(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// Placeholder types for scheduler and metrics
-type TWAPScheduler struct {
-	logger *zap.Logger
-	engine *ProductionTWAPEngine
-}
-
-func NewTWAPScheduler(logger *zap.Logger, engine *ProductionTWAPEngine) *TWAPScheduler {
-	return &TWAPScheduler{
-		logger: logger,
-		engine: engine,
-	}
-}
-
-func (s *TWAPScheduler) Start(ctx context.Context) {
-	// Scheduler implementation
-}
-
-func (s *TWAPScheduler) ScheduleOrder(order *TWAPOrder) {
-	// Schedule order implementation
 }
 
 type TWAPMetrics struct {
