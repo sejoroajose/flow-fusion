@@ -279,10 +279,7 @@ func loggingMiddleware(logger *zap.Logger) gin.HandlerFunc {
 }
 
 func rateLimitMiddleware() gin.HandlerFunc {
-	// Implement rate limiting for production
 	return func(c *gin.Context) {
-		// Simple in-memory rate limiting
-		// In production, use Redis-based rate limiting
 		c.Next()
 	}
 }
