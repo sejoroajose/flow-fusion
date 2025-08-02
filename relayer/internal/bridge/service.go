@@ -2,66 +2,104 @@ package bridge
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"github.com/1inch/1inch-sdk-go/sdk-clients/fusionplus"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/aggregation"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/tokens"
+	"github.com/1inch/1inch-sdk-go/constants"
+
 	"flow-fusion/relayer/internal/cosmos"
 	"flow-fusion/relayer/internal/ethereum"
-	"flow-fusion/relayer/internal/twap"
 )
 
-type Service struct {
-	config         Config
-	ethClient      *ethereum.Client
-	cosmosClient   *cosmos.Client
-	twapEngine     *twap.Engine
-	logger         *zap.Logger
+// Production 1inch Fusion+ Bridge Service
+type FusionBridgeService struct {
+	config           Config
+	ethClient        *ethereum.Client
+	cosmosClient     *cosmos.Client
+	logger           *zap.Logger
+	
+	// 1inch SDK clients
+	fusionPlusClient *fusionplus.Client
+	orderbookClient  *orderbook.Client
+	aggregationClient *aggregation.Client
+	tokensClient     *tokens.Client
 	
 	// State management
-	orders         map[string]*BridgeOrder
-	ordersMutex    sync.RWMutex
+	bridgeOrders     map[string]*BridgeOrder
+	ordersMutex      sync.RWMutex
 	
 	// WebSocket connections
-	wsUpgrader     websocket.Upgrader
-	wsConnections  map[*websocket.Conn]bool
+	wsUpgrader       websocket.Upgrader
+	wsConnections    map[*websocket.Conn]bool
 	wsConnectionsMutex sync.RWMutex
 	
 	// Metrics
-	metrics        *BridgeMetrics
+	metrics          *BridgeMetrics
+	
+	// Private key for signing
+	privateKey       *ecdsa.PrivateKey
+	publicAddress    common.Address
 }
 
 type Config struct {
 	EthereumClient *ethereum.Client
 	CosmosClient   *cosmos.Client
-	TWAPEngine     *twap.Engine
 	Logger         *zap.Logger
+	OneInchAPIKey  string
+	PrivateKey     string
+	NodeURL        string
+	ChainID        int
 }
 
 type BridgeOrder struct {
-	ID              string                 `json:"id"`
-	UserAddress     string                 `json:"user_address"`
-	SourceChain     string                 `json:"source_chain"`
-	DestChain       string                 `json:"dest_chain"`
-	SourceToken     string                 `json:"source_token"`
-	DestToken       string                 `json:"dest_token"`
-	Amount          *big.Int               `json:"amount"`
-	Status          BridgeOrderStatus      `json:"status"`
-	CreatedAt       time.Time              `json:"created_at"`
-	EthereumTxHash  string                 `json:"ethereum_tx_hash,omitempty"`
-	CosmosTxHash    string                 `json:"cosmos_tx_hash,omitempty"`
-	SecretHash      string                 `json:"secret_hash"`
-	Secret          []byte                 `json:"-"` // Never expose
-	TimeLock        uint64                 `json:"time_lock"`
-	CompletedAt     *time.Time             `json:"completed_at,omitempty"`
-	Error           string                 `json:"error,omitempty"`
-	TWAPOrderID     string                 `json:"twap_order_id,omitempty"`
+	ID                  string                 `json:"id"`
+	UserAddress         string                 `json:"user_address"`
+	SourceChain         string                 `json:"source_chain"`
+	DestChain           string                 `json:"dest_chain"`
+	SourceToken         string                 `json:"source_token"`
+	DestToken           string                 `json:"dest_token"`
+	Amount              *big.Int               `json:"amount"`
+	Status              BridgeOrderStatus      `json:"status"`
+	CreatedAt           time.Time              `json:"created_at"`
+	
+	// 1inch Fusion+ specific fields
+	OneInchOrderHash    string                 `json:"oneinch_order_hash"`
+	Secrets             []string               `json:"-"` // Never expose secrets
+	SecretHashes        []string               `json:"secret_hashes"`
+	HashLock            *fusionplus.HashLock   `json:"-"`
+	FusionPlusOrder     *fusionplus.Order      `json:"fusion_plus_order,omitempty"`
+	
+	// Cross-chain tracking
+	EthereumTxHash      string                 `json:"ethereum_tx_hash,omitempty"`
+	CosmosTxHash        string                 `json:"cosmos_tx_hash,omitempty"`
+	CompletedAt         *time.Time             `json:"completed_at,omitempty"`
+	Error               string                 `json:"error,omitempty"`
+	
+	// TWAP support
+	TWAPEnabled         bool                   `json:"twap_enabled"`
+	TWAPConfig          *TWAPConfiguration     `json:"twap_config,omitempty"`
+}
+
+type TWAPConfiguration struct {
+	TimeWindow    int     `json:"time_window"`
+	IntervalCount int     `json:"interval_count"`
+	MaxSlippage   float64 `json:"max_slippage"`
+	StartTime     time.Time `json:"start_time"`
 }
 
 type BridgeOrderStatus string
@@ -82,22 +120,16 @@ type BridgeMetrics struct {
 	mutex           sync.RWMutex
 }
 
-// Request/Response types
+// Request/Response types for API endpoints
 type CreateBridgeOrderRequest struct {
-	UserAddress string `json:"user_address" binding:"required"`
-	SourceChain string `json:"source_chain" binding:"required"`
-	DestChain   string `json:"dest_chain" binding:"required"`
-	SourceToken string `json:"source_token" binding:"required"`
-	DestToken   string `json:"dest_token" binding:"required"`
-	Amount      string `json:"amount" binding:"required"`
-	UseTWAP     bool   `json:"use_twap,omitempty"`
-	TWAPConfig  *TWAPOrderConfig `json:"twap_config,omitempty"`
-}
-
-type TWAPOrderConfig struct {
-	TimeWindow    int     `json:"time_window"`
-	IntervalCount int     `json:"interval_count"`
-	MaxSlippage   float64 `json:"max_slippage"`
+	UserAddress string             `json:"user_address" binding:"required"`
+	SourceChain string             `json:"source_chain" binding:"required"`
+	DestChain   string             `json:"dest_chain" binding:"required"`
+	SourceToken string             `json:"source_token" binding:"required"`
+	DestToken   string             `json:"dest_token" binding:"required"`
+	Amount      string             `json:"amount" binding:"required"`
+	TWAPEnabled bool               `json:"twap_enabled,omitempty"`
+	TWAPConfig  *TWAPConfiguration `json:"twap_config,omitempty"`
 }
 
 type BridgeQuoteRequest struct {
@@ -114,70 +146,144 @@ type BridgeQuoteResponse struct {
 	ExecutionTime   time.Duration `json:"execution_time"`
 	PriceImpact     float64       `json:"price_impact"`
 	Route           []string      `json:"route"`
+	QuoteData       interface{}   `json:"quote_data"` // Raw 1inch quote data
 }
 
-func NewService(config Config) (*Service, error) {
+func NewFusionBridgeService(config Config) (*FusionBridgeService, error) {
+	// Parse private key
+	privateKey, err := crypto.HexToECDSA(config.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+	
+	publicKey := privateKey.Public()
+	publicAddress := crypto.PubkeyToAddress(*publicKey.(*ecdsa.PublicKey))
+
+	// Initialize 1inch Fusion+ client
+	fusionConfig, err := fusionplus.NewConfiguration(fusionplus.ConfigurationParams{
+		ApiUrl:     "https://api.1inch.dev",
+		ApiKey:     config.OneInchAPIKey,
+		PrivateKey: config.PrivateKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create fusion+ config: %w", err)
+	}
+
+	fusionClient, err := fusionplus.NewClient(fusionConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create fusion+ client: %w", err)
+	}
+
+	// Initialize orderbook client for limit orders
+	orderbookConfig, err := orderbook.NewConfiguration(orderbook.ConfigurationParams{
+		NodeUrl:    config.NodeURL,
+		PrivateKey: config.PrivateKey,
+		ChainId:    config.ChainID,
+		ApiUrl:     "https://api.1inch.dev",
+		ApiKey:     config.OneInchAPIKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create orderbook config: %w", err)
+	}
+
+	orderbookClient, err := orderbook.NewClient(orderbookConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create orderbook client: %w", err)
+	}
+
+	// Initialize aggregation client
+	aggConfig, err := aggregation.NewConfigurationAPI(
+		config.ChainID,
+		"https://api.1inch.dev",
+		config.OneInchAPIKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create aggregation config: %w", err)
+	}
+
+	aggClient, err := aggregation.NewClientOnlyAPI(aggConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create aggregation client: %w", err)
+	}
+
+	// Initialize tokens client
+	tokensConfig, err := tokens.NewConfiguration(tokens.ConfigurationParams{
+		ChainId: config.ChainID,
+		ApiUrl:  "https://api.1inch.dev",
+		ApiKey:  config.OneInchAPIKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tokens config: %w", err)
+	}
+
+	tokensClient, err := tokens.NewClient(tokensConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tokens client: %w", err)
+	}
+
 	wsUpgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all origins for demo
+			return true // Configure proper CORS in production
 		},
 	}
 
-	service := &Service{
-		config:         config,
-		ethClient:      config.EthereumClient,
-		cosmosClient:   config.CosmosClient,
-		twapEngine:     config.TWAPEngine,
-		logger:         config.Logger,
-		orders:         make(map[string]*BridgeOrder),
-		wsUpgrader:     wsUpgrader,
-		wsConnections:  make(map[*websocket.Conn]bool),
-		metrics:        NewBridgeMetrics(),
+	service := &FusionBridgeService{
+		config:            config,
+		ethClient:         config.EthereumClient,
+		cosmosClient:      config.CosmosClient,
+		logger:            config.Logger,
+		fusionPlusClient:  fusionClient,
+		orderbookClient:   orderbookClient,
+		aggregationClient: aggClient,
+		tokensClient:      tokensClient,
+		bridgeOrders:      make(map[string]*BridgeOrder),
+		wsUpgrader:        wsUpgrader,
+		wsConnections:     make(map[*websocket.Conn]bool),
+		metrics:           NewBridgeMetrics(),
+		privateKey:        privateKey,
+		publicAddress:     publicAddress,
 	}
 
 	return service, nil
 }
 
-func (s *Service) Start(ctx context.Context) error {
-	s.logger.Info("Starting Bridge Service")
+func (s *FusionBridgeService) Start(ctx context.Context) error {
+	s.logger.Info("Starting Production Fusion+ Bridge Service",
+		zap.String("public_address", s.publicAddress.Hex()),
+		zap.Int("chain_id", s.config.ChainID),
+	)
 
-	// Start event watchers
-	go s.watchEthereumEvents(ctx)
-	go s.watchCosmosEvents(ctx)
+	// Start order monitoring and processing
+	go s.monitorOrders(ctx)
+	go s.processFusionPlusOrders(ctx)
 
 	// Main processing loop
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("Bridge Service stopping")
+			s.logger.Info("Fusion+ Bridge Service stopping")
 			return ctx.Err()
 		case <-ticker.C:
-			s.processOrders(ctx)
+			if err := s.processOrders(ctx); err != nil {
+				s.logger.Error("Error processing orders", zap.Error(err))
+			}
 		}
 	}
 }
 
-func (s *Service) GetQuote(c *gin.Context) {
+func (s *FusionBridgeService) GetQuote(c *gin.Context) {
 	var req BridgeQuoteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Parse amount
-	amount, ok := new(big.Int).SetString(req.Amount, 10)
-	if !ok || amount.Sign() <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid amount"})
-		return
-	}
-
-	// Calculate quote
-	quote, err := s.calculateQuote(req, amount)
+	quote, err := s.calculateFusionPlusQuote(c.Request.Context(), req)
 	if err != nil {
-		s.logger.Error("Failed to calculate quote", zap.Error(err))
+		s.logger.Error("Failed to calculate Fusion+ quote", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to calculate quote"})
 		return
 	}
@@ -185,39 +291,341 @@ func (s *Service) GetQuote(c *gin.Context) {
 	c.JSON(http.StatusOK, quote)
 }
 
-func (s *Service) CreateOrder(c *gin.Context) {
+func (s *FusionBridgeService) CreateOrder(c *gin.Context) {
 	var req CreateBridgeOrderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Parse amount
 	amount, ok := new(big.Int).SetString(req.Amount, 10)
 	if !ok || amount.Sign() <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid amount"})
 		return
 	}
 
-	// Create bridge order
-	order, err := s.createBridgeOrder(req, amount)
+	order, err := s.createFusionPlusOrder(c.Request.Context(), req, amount)
 	if err != nil {
-		s.logger.Error("Failed to create bridge order", zap.Error(err))
+		s.logger.Error("Failed to create Fusion+ order", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create order"})
 		return
 	}
 
-	// Broadcast to WebSocket clients
 	s.broadcastOrderUpdate(order)
-
 	c.JSON(http.StatusCreated, order)
 }
 
-func (s *Service) GetOrder(c *gin.Context) {
+func (s *FusionBridgeService) calculateFusionPlusQuote(ctx context.Context, req BridgeQuoteRequest) (*BridgeQuoteResponse, error) {
+	// Determine chain IDs for Fusion+
+	srcChain, dstChain, err := s.getChainIDs(req.SourceChain, req.DestChain)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chain configuration: %w", err)
+	}
+
+	// Get Fusion+ quote
+	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
+		SrcChain:        float32(srcChain),
+		DstChain:        float32(dstChain),
+		SrcTokenAddress: req.SourceToken,
+		DstTokenAddress: req.DestToken,
+		Amount:          req.Amount,
+		WalletAddress:   s.publicAddress.Hex(),
+		EnableEstimate:  true,
+	}
+
+	quote, err := s.fusionPlusClient.GetQuote(ctx, quoteParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Fusion+ quote: %w", err)
+	}
+
+	// Calculate estimated fees (gas + protocol fees)
+	estimatedFees := s.calculateEstimatedFees(quote)
+
+	return &BridgeQuoteResponse{
+		EstimatedOutput: quote.DstTokenAmount,
+		EstimatedFees:   estimatedFees,
+		ExecutionTime:   5 * time.Minute, // Typical cross-chain execution time
+		PriceImpact:     0.001, // Will be calculated from quote data
+		Route:          []string{req.SourceChain, req.DestChain},
+		QuoteData:      quote,
+	}, nil
+}
+
+func (s *FusionBridgeService) createFusionPlusOrder(ctx context.Context, req CreateBridgeOrderRequest, amount *big.Int) (*BridgeOrder, error) {
+	// Determine chain IDs
+	srcChain, dstChain, err := s.getChainIDs(req.SourceChain, req.DestChain)
+	if err != nil {
+		return nil, fmt.Errorf("invalid chain configuration: %w", err)
+	}
+
+	// Generate order ID
+	orderID := s.generateOrderID()
+
+	// Get quote for the order
+	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
+		SrcChain:        float32(srcChain),
+		DstChain:        float32(dstChain),
+		SrcTokenAddress: req.SourceToken,
+		DstTokenAddress: req.DestToken,
+		Amount:          amount.String(),
+		WalletAddress:   req.UserAddress,
+		EnableEstimate:  true,
+	}
+
+	quote, err := s.fusionPlusClient.GetQuote(ctx, quoteParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get quote for order: %w", err)
+	}
+
+	// Get recommended preset
+	preset, err := fusionplus.GetPreset(quote.Presets, quote.RecommendedPreset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get preset: %w", err)
+	}
+
+	// Generate secrets based on preset requirements
+	secretsCount := int(preset.SecretsCount)
+	secrets := make([]string, secretsCount)
+	secretHashes := make([]string, secretsCount)
+
+	for i := 0; i < secretsCount; i++ {
+		randomBytes, err := fusionplus.GetRandomBytes32()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate secret %d: %w", i, err)
+		}
+		secrets[i] = randomBytes
+
+		secretHash, err := fusionplus.HashSecret(randomBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash secret %d: %w", i, err)
+		}
+		secretHashes[i] = secretHash
+	}
+
+	// Create hash lock
+	var hashLock *fusionplus.HashLock
+	if secretsCount == 1 {
+		hashLock, err = fusionplus.ForSingleFill(secrets[0])
+	} else {
+		hashLock, err = fusionplus.ForMultipleFills(secrets)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create hash lock: %w", err)
+	}
+
+	// Prepare order parameters
+	orderParams := fusionplus.OrderParams{
+		HashLock:     hashLock,
+		SecretHashes: secretHashes,
+		Receiver:     req.UserAddress,
+		Preset:       quote.RecommendedPreset,
+	}
+
+	// Place the Fusion+ order
+	orderHash, err := s.fusionPlusClient.PlaceOrder(ctx, quoteParams, quote, orderParams, s.fusionPlusClient.Wallet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to place Fusion+ order: %w", err)
+	}
+
+	// Create bridge order record
+	bridgeOrder := &BridgeOrder{
+		ID:               orderID,
+		UserAddress:      req.UserAddress,
+		SourceChain:      req.SourceChain,
+		DestChain:        req.DestChain,
+		SourceToken:      req.SourceToken,
+		DestToken:        req.DestToken,
+		Amount:           amount,
+		Status:           BridgeOrderStatusPending,
+		CreatedAt:        time.Now(),
+		OneInchOrderHash: orderHash,
+		Secrets:          secrets,
+		SecretHashes:     secretHashes,
+		HashLock:         hashLock,
+		TWAPEnabled:      req.TWAPEnabled,
+		TWAPConfig:       req.TWAPConfig,
+	}
+
+	// Store order
+	s.ordersMutex.Lock()
+	s.bridgeOrders[orderID] = bridgeOrder
+	s.ordersMutex.Unlock()
+
+	// Update metrics
+	s.metrics.mutex.Lock()
+	s.metrics.TotalOrders++
+	s.metrics.TotalVolume.Add(s.metrics.TotalVolume, amount)
+	s.metrics.mutex.Unlock()
+
+	s.logger.Info("Fusion+ bridge order created",
+		zap.String("order_id", orderID),
+		zap.String("oneinch_order_hash", orderHash),
+		zap.String("user", req.UserAddress),
+		zap.String("amount", amount.String()),
+		zap.Bool("twap_enabled", req.TWAPEnabled),
+	)
+
+	return bridgeOrder, nil
+}
+
+func (s *FusionBridgeService) processFusionPlusOrders(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.ordersMutex.RLock()
+			orders := make([]*BridgeOrder, 0)
+			for _, order := range s.bridgeOrders {
+				if order.Status == BridgeOrderStatusPending || order.Status == BridgeOrderStatusProcessing {
+					orders = append(orders, order)
+				}
+			}
+			s.ordersMutex.RUnlock()
+
+			for _, order := range orders {
+				go s.processFusionPlusOrder(ctx, order)
+			}
+		}
+	}
+}
+
+func (s *FusionBridgeService) processFusionPlusOrder(ctx context.Context, order *BridgeOrder) {
+	// Check order status in 1inch
+	fusionOrder, err := s.fusionPlusClient.GetOrderByOrderHash(ctx, fusionplus.GetOrderByOrderHashParams{
+		Hash: order.OneInchOrderHash,
+	})
+	if err != nil {
+		s.logger.Error("Failed to get Fusion+ order status",
+			zap.String("order_id", order.ID),
+			zap.String("oneinch_hash", order.OneInchOrderHash),
+			zap.Error(err),
+		)
+		return
+	}
+
+	order.FusionPlusOrder = fusionOrder
+
+	// Update order status based on Fusion+ status
+	switch string(fusionOrder.Status) {
+	case "pending":
+		if order.Status != BridgeOrderStatusPending {
+			order.Status = BridgeOrderStatusPending
+			s.broadcastOrderUpdate(order)
+		}
+	case "executed":
+		if order.Status != BridgeOrderStatusCompleted {
+			order.Status = BridgeOrderStatusCompleted
+			now := time.Now()
+			order.CompletedAt = &now
+			
+			// Update metrics
+			s.metrics.mutex.Lock()
+			s.metrics.CompletedOrders++
+			s.metrics.mutex.Unlock()
+			
+			s.broadcastOrderUpdate(order)
+			s.logger.Info("Fusion+ order completed",
+				zap.String("order_id", order.ID),
+				zap.String("oneinch_hash", order.OneInchOrderHash),
+			)
+		}
+	case "refunded":
+		if order.Status != BridgeOrderStatusFailed {
+			order.Status = BridgeOrderStatusFailed
+			order.Error = "Order was refunded"
+			
+			// Update metrics
+			s.metrics.mutex.Lock()
+			s.metrics.FailedOrders++
+			s.metrics.mutex.Unlock()
+			
+			s.broadcastOrderUpdate(order)
+			s.logger.Warn("Fusion+ order was refunded",
+				zap.String("order_id", order.ID),
+				zap.String("oneinch_hash", order.OneInchOrderHash),
+			)
+		}
+	}
+
+	// Check for ready-to-accept fills
+	fills, err := s.fusionPlusClient.GetReadyToAcceptFills(ctx, fusionplus.GetOrderByOrderHashParams{
+		Hash: order.OneInchOrderHash,
+	})
+	if err != nil {
+		s.logger.Error("Failed to get ready fills",
+			zap.String("order_id", order.ID),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Submit secrets for ready fills
+	if len(fills.Fills) > 0 && len(order.Secrets) > 0 {
+		order.Status = BridgeOrderStatusProcessing
+		s.broadcastOrderUpdate(order)
+
+		// Submit secret for the first fill (can be extended for multiple fills)
+		err = s.fusionPlusClient.SubmitSecret(ctx, fusionplus.SecretInput{
+			OrderHash: order.OneInchOrderHash,
+			Secret:    order.Secrets[0],
+		})
+		if err != nil {
+			s.logger.Error("Failed to submit secret",
+				zap.String("order_id", order.ID),
+				zap.Error(err),
+			)
+			return
+		}
+
+		s.logger.Info("Secret submitted for Fusion+ order",
+			zap.String("order_id", order.ID),
+			zap.String("oneinch_hash", order.OneInchOrderHash),
+		)
+
+		// Create corresponding Cosmos escrow
+		if err := s.createCosmosEscrow(ctx, order); err != nil {
+			s.logger.Error("Failed to create Cosmos escrow",
+				zap.String("order_id", order.ID),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+func (s *FusionBridgeService) createCosmosEscrow(ctx context.Context, order *BridgeOrder) error {
+	// Create Cosmos escrow using the order details
+	params := cosmos.CreateEscrowParams{
+		EthereumTxHash: order.OneInchOrderHash, // Use 1inch order hash as reference
+		SecretHash:     order.SecretHashes[0],  // Use first secret hash
+		TimeLock:       uint64(time.Now().Add(24 * time.Hour).Unix()),
+		Recipient:      order.UserAddress,
+		EthereumSender: s.publicAddress.Hex(),
+		Amount:         order.Amount,
+	}
+
+	txHash, err := s.cosmosClient.CreateEscrow(ctx, params)
+	if err != nil {
+		return fmt.Errorf("failed to create Cosmos escrow: %w", err)
+	}
+
+	order.CosmosTxHash = txHash
+	s.logger.Info("Created Cosmos escrow",
+		zap.String("order_id", order.ID),
+		zap.String("cosmos_tx", txHash),
+	)
+
+	return nil
+}
+
+func (s *FusionBridgeService) GetOrder(c *gin.Context) {
 	orderID := c.Param("id")
 	
 	s.ordersMutex.RLock()
-	order, exists := s.orders[orderID]
+	order, exists := s.bridgeOrders[orderID]
 	s.ordersMutex.RUnlock()
 	
 	if !exists {
@@ -228,10 +636,10 @@ func (s *Service) GetOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, order)
 }
 
-func (s *Service) ListOrders(c *gin.Context) {
+func (s *FusionBridgeService) ListOrders(c *gin.Context) {
 	s.ordersMutex.RLock()
-	orders := make([]*BridgeOrder, 0, len(s.orders))
-	for _, order := range s.orders {
+	orders := make([]*BridgeOrder, 0, len(s.bridgeOrders))
+	for _, order := range s.bridgeOrders {
 		orders = append(orders, order)
 	}
 	s.ordersMutex.RUnlock()
@@ -242,11 +650,11 @@ func (s *Service) ListOrders(c *gin.Context) {
 	})
 }
 
-func (s *Service) CancelOrder(c *gin.Context) {
+func (s *FusionBridgeService) CancelOrder(c *gin.Context) {
 	orderID := c.Param("id")
 	
 	s.ordersMutex.Lock()
-	order, exists := s.orders[orderID]
+	order, exists := s.bridgeOrders[orderID]
 	if exists && order.Status == BridgeOrderStatusPending {
 		order.Status = BridgeOrderStatusCancelled
 		s.broadcastOrderUpdate(order)
@@ -261,7 +669,7 @@ func (s *Service) CancelOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "order cancelled"})
 }
 
-func (s *Service) GetMetrics(c *gin.Context) {
+func (s *FusionBridgeService) GetMetrics(c *gin.Context) {
 	s.metrics.mutex.RLock()
 	metrics := map[string]interface{}{
 		"total_orders":     s.metrics.TotalOrders,
@@ -270,74 +678,20 @@ func (s *Service) GetMetrics(c *gin.Context) {
 		"total_volume":     s.metrics.TotalVolume.String(),
 		"uptime":          time.Since(s.metrics.StartTime).String(),
 		"success_rate":    s.calculateSuccessRate(),
+		"public_address":  s.publicAddress.Hex(),
+		"chain_id":        s.config.ChainID,
 	}
 	s.metrics.mutex.RUnlock()
 
 	c.JSON(http.StatusOK, metrics)
 }
 
-func (s *Service) GetEthereumStatus(c *gin.Context) {
-	balance, err := s.ethClient.GetBalance(context.Background())
+func (s *FusionBridgeService) HandleWebSocket(c *gin.Context) {
+	conn, err := s.wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get balance"})
+		s.logger.Error("Failed to upgrade WebSocket", zap.Error(err))
 		return
 	}
-
-	blockNumber, err := s.ethClient.GetCurrentBlockNumber(context.Background())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get block number"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"status":       "connected",
-		"address":      s.ethClient.GetAddress().Hex(),
-		"balance":      balance.String(),
-		"block_number": blockNumber,
-	})
-}
-
-func (s *Service) GetCosmosStatus(c *gin.Context) {
-	balance, err := s.cosmosClient.GetBalance(context.Background(), "cosmos1demo")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get balance"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"status":      "connected",
-		"chain_id":    s.cosmosClient.GetChainID(),
-		"balance":     balance.String(),
-		"contract":    s.cosmosClient.GetContractAddress(),
-	})
-}
-
-func (s *Service) HandleWebSocket(c *gin.Context) {
-	wsUpgrader := websocket.Upgrader{
-        CheckOrigin: func(r *http.Request) bool {
-            allowedOrigins := []string{"https://flow-fusion.com", "https://api.flow-fusion.com"}
-            origin := r.Header.Get("Origin")
-            for _, allowed := range allowedOrigins {
-                if origin == allowed {
-                    return true
-                }
-            }
-            return false
-        },
-    }
-
-	conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
-    if err != nil {
-        s.logger.Error("Failed to upgrade WebSocket", zap.Error(err))
-        return
-    }
-
-	token := c.Query("token")
-    if !s.validateWebSocketToken(token) {
-        conn.Close()
-        return
-    }
-
 	defer conn.Close()
 
 	// Add connection
@@ -361,123 +715,44 @@ func (s *Service) HandleWebSocket(c *gin.Context) {
 	}
 }
 
-func (s *Service) validateWebSocketToken(token string) bool {
-    // Implement JWT or other token validation
-    return true // Replace with actual validation logic
-}
-
-func (s *Service) calculateQuote(req BridgeQuoteRequest, amount *big.Int) (*BridgeQuoteResponse, error) {
-	// For demo purposes, return mock quote
-	estimatedOutput := new(big.Int).Mul(amount, big.NewInt(99))
-	estimatedOutput.Div(estimatedOutput, big.NewInt(100)) // 99% of input
-
-	return &BridgeQuoteResponse{
-		EstimatedOutput: estimatedOutput.String(),
-		EstimatedFees:   "10000", // 0.01 tokens
-		ExecutionTime:   5 * time.Minute,
-		PriceImpact:     0.001, // 0.1%
-		Route:          []string{req.SourceChain, req.DestChain},
-	}, nil
-}
-
-func (s *Service) createBridgeOrder(req CreateBridgeOrderRequest, amount *big.Int) (*BridgeOrder, error) {
-	orderID := s.generateOrderID()
-	
-	order := &BridgeOrder{
-		ID:          orderID,
-		UserAddress: req.UserAddress,
-		SourceChain: req.SourceChain,
-		DestChain:   req.DestChain,
-		SourceToken: req.SourceToken,
-		DestToken:   req.DestToken,
-		Amount:      amount,
-		Status:      BridgeOrderStatusPending,
-		CreatedAt:   time.Now(),
-		SecretHash:  s.generateSecretHash(),
-		Secret:      s.generateSecret(),
-		TimeLock:    3600, // 1 hour
+// Helper methods
+func (s *FusionBridgeService) getChainIDs(sourceChain, destChain string) (int, int, error) {
+	chainMap := map[string]int{
+		"ethereum": constants.EthereumChainId,
+		"polygon":  constants.PolygonChainId,
+		"arbitrum": constants.ArbitrumChainId,
+		"base":     constants.BaseChainId,
+		"cosmos":   1, // Custom chain ID for Cosmos
 	}
 
-	// If TWAP is requested, create TWAP order
-	if req.UseTWAP && req.TWAPConfig != nil {
-		// This would integrate with the TWAP engine
-		order.TWAPOrderID = "twap_" + orderID
+	srcChainID, srcExists := chainMap[sourceChain]
+	dstChainID, dstExists := chainMap[destChain]
+
+	if !srcExists || !dstExists {
+		return 0, 0, fmt.Errorf("unsupported chain: src=%s, dst=%s", sourceChain, destChain)
 	}
 
-	// Store order
-	s.ordersMutex.Lock()
-	s.orders[orderID] = order
-	s.ordersMutex.Unlock()
-
-	// Update metrics
-	s.metrics.mutex.Lock()
-	s.metrics.TotalOrders++
-	s.metrics.TotalVolume.Add(s.metrics.TotalVolume, amount)
-	s.metrics.mutex.Unlock()
-
-	s.logger.Info("Bridge order created",
-		zap.String("order_id", orderID),
-		zap.String("user", req.UserAddress),
-		zap.String("amount", amount.String()),
-		zap.Bool("use_twap", req.UseTWAP),
-	)
-
-	return order, nil
+	return srcChainID, dstChainID, nil
 }
 
-func (s *Service) processOrders(ctx context.Context) {
-	s.ordersMutex.RLock()
-	orders := make([]*BridgeOrder, 0)
-	for _, order := range s.orders {
-		if order.Status == BridgeOrderStatusPending {
-			orders = append(orders, order)
-		}
+func (s *FusionBridgeService) calculateEstimatedFees(quote interface{}) string {
+	// Implementation depends on the quote structure
+	// This would calculate gas costs + protocol fees
+	return "1000000" // Placeholder - implement based on actual quote data
+}
+
+func (s *FusionBridgeService) generateOrderID() string {
+	return fmt.Sprintf("fusion_%d_%s", time.Now().UnixNano(), hex.EncodeToString([]byte{byte(len(s.bridgeOrders))}))
+}
+
+func (s *FusionBridgeService) calculateSuccessRate() float64 {
+	if s.metrics.TotalOrders == 0 {
+		return 0
 	}
-	s.ordersMutex.RUnlock()
-
-	for _, order := range orders {
-		go s.processOrder(ctx, order)
-	}
+	return float64(s.metrics.CompletedOrders) / float64(s.metrics.TotalOrders) * 100
 }
 
-func (s *Service) processOrder(ctx context.Context, order *BridgeOrder) {
-	order.Status = BridgeOrderStatusProcessing
-	s.broadcastOrderUpdate(order)
-
-	// Simulate order processing
-	time.Sleep(3 * time.Second)
-
-	// For demo purposes, mark as completed
-	order.Status = BridgeOrderStatusCompleted
-	now := time.Now()
-	order.CompletedAt = &now
-	order.EthereumTxHash = "0xdemo_eth_tx"
-	order.CosmosTxHash = "demo_cosmos_tx"
-
-	// Update metrics
-	s.metrics.mutex.Lock()
-	s.metrics.CompletedOrders++
-	s.metrics.mutex.Unlock()
-
-	s.broadcastOrderUpdate(order)
-
-	s.logger.Info("Bridge order completed",
-		zap.String("order_id", order.ID),
-		zap.Duration("duration", time.Since(order.CreatedAt)),
-	)
-}
-
-func (s *Service) watchEthereumEvents(ctx context.Context) {
-	// Implementation would watch for Ethereum escrow events
-	s.logger.Info("Started Ethereum event watcher")
-}
-
-func (s *Service) watchCosmosEvents(ctx context.Context) {
-	// Implementation would watch for Cosmos escrow events
-	s.logger.Info("Started Cosmos event watcher")
-}
-
-func (s *Service) broadcastOrderUpdate(order *BridgeOrder) {
+func (s *FusionBridgeService) broadcastOrderUpdate(order *BridgeOrder) {
 	s.wsConnectionsMutex.RLock()
 	connections := make([]*websocket.Conn, 0, len(s.wsConnections))
 	for conn := range s.wsConnections {
@@ -492,7 +767,6 @@ func (s *Service) broadcastOrderUpdate(order *BridgeOrder) {
 
 	for _, conn := range connections {
 		if err := conn.WriteJSON(message); err != nil {
-			// Remove failed connection
 			s.wsConnectionsMutex.Lock()
 			delete(s.wsConnections, conn)
 			s.wsConnectionsMutex.Unlock()
@@ -500,36 +774,58 @@ func (s *Service) broadcastOrderUpdate(order *BridgeOrder) {
 	}
 }
 
-func (s *Service) generateOrderID() string {
-	return fmt.Sprintf("bridge_%d", time.Now().UnixNano())
-}
+func (s *FusionBridgeService) monitorOrders(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 
-func (s *Service) generateSecretHash() string {
-	return fmt.Sprintf("hash_%d", time.Now().UnixNano())
-}
-
-func (s *Service) generateSecret() []byte {
-	return []byte(fmt.Sprintf("secret_%d", time.Now().UnixNano()))
-}
-
-func (s *Service) calculateSuccessRate() float64 {
-	s.metrics.mutex.RLock()
-	defer s.metrics.mutex.RUnlock()
-	
-	if s.metrics.TotalOrders == 0 {
-		return 0
-	}
-	return float64(s.metrics.CompletedOrders) / float64(s.metrics.TotalOrders) * 100
-}
-
-func NewBridgeMetrics() *BridgeMetrics {
-	return &BridgeMetrics{
-		TotalVolume: big.NewInt(0),
-		StartTime:   time.Now(),
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Monitor order health and timeouts
+			s.checkOrderHealth()
+		}
 	}
 }
 
-func (s *Service) GetEthereumStatusData() map[string]interface{} {
+func (s *FusionBridgeService) checkOrderHealth() {
+	s.ordersMutex.RLock()
+	orders := make([]*BridgeOrder, 0, len(s.bridgeOrders))
+	for _, order := range s.bridgeOrders {
+		if order.Status == BridgeOrderStatusProcessing {
+			orders = append(orders, order)
+		}
+	}
+	s.ordersMutex.RUnlock()
+
+	for _, order := range orders {
+		// Check for order timeout (24 hours)
+		if time.Since(order.CreatedAt) > 24*time.Hour {
+			s.ordersMutex.Lock()
+			order.Status = BridgeOrderStatusFailed
+			order.Error = "Order timeout"
+			s.ordersMutex.Unlock()
+
+			s.metrics.mutex.Lock()
+			s.metrics.FailedOrders++
+			s.metrics.mutex.Unlock()
+
+			s.broadcastOrderUpdate(order)
+			s.logger.Warn("Order timed out",
+				zap.String("order_id", order.ID),
+				zap.Duration("age", time.Since(order.CreatedAt)),
+			)
+		}
+	}
+}
+
+func (s *FusionBridgeService) processOrders(ctx context.Context) error {
+	// Additional order processing logic can be added here
+	return nil
+}
+
+func (s *FusionBridgeService) GetEthereumStatusData() map[string]interface{} {
 	balance, err := s.ethClient.GetBalance(context.Background())
 	if err != nil {
 		return map[string]interface{}{
@@ -541,22 +837,22 @@ func (s *Service) GetEthereumStatusData() map[string]interface{} {
 	blockNumber, err := s.ethClient.GetCurrentBlockNumber(context.Background())
 	if err != nil {
 		return map[string]interface{}{
-			"status": "error", 
+			"status": "error",
 			"error":  err.Error(),
 		}
 	}
 
 	return map[string]interface{}{
-		"status":       "connected",
-		"address":      s.ethClient.GetAddress().Hex(),
-		"balance":      balance.String(),
-		"block_number": blockNumber,
+		"status":         "connected",
+		"address":        s.ethClient.GetAddress().Hex(),
+		"balance":        balance.String(),
+		"block_number":   blockNumber,
+		"fusion_address": s.publicAddress.Hex(),
 	}
 }
 
-// GetCosmosStatusData returns Cosmos status data without handling HTTP response
-func (s *Service) GetCosmosStatusData() map[string]interface{} {
-	balance, err := s.cosmosClient.GetBalance(context.Background(), "cosmos1demo")
+func (s *FusionBridgeService) GetCosmosStatusData() map[string]interface{} {
+	balance, err := s.cosmosClient.GetBalance(context.Background(), "")
 	if err != nil {
 		return map[string]interface{}{
 			"status": "error",
@@ -569,5 +865,12 @@ func (s *Service) GetCosmosStatusData() map[string]interface{} {
 		"chain_id": s.cosmosClient.GetChainID(),
 		"balance":  balance.String(),
 		"contract": s.cosmosClient.GetContractAddress(),
+	}
+}
+
+func NewBridgeMetrics() *BridgeMetrics {
+	return &BridgeMetrics{
+		TotalVolume: big.NewInt(0),
+		StartTime:   time.Now(),
 	}
 }

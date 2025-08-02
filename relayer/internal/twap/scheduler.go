@@ -2,110 +2,118 @@ package twap
 
 import (
 	"context"
+	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"go.uber.org/zap"
+
+	"github.com/1inch/1inch-sdk-go/sdk-clients/fusionplus"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
 )
 
-// ExecutionScheduler manages the scheduling and execution of TWAP orders
-type ExecutionScheduler struct {
-	logger          *zap.Logger
-	engine          *Engine
-	scheduledOrders map[string]*TWAPOrder
-	mutex           sync.RWMutex
-	ticker          *time.Ticker
-	workerPool      chan struct{}
-	stopChan        chan struct{}
+// TWAPScheduler manages the scheduling and execution of TWAP orders using 1inch protocols
+type TWAPScheduler struct {
+	engine              *ProductionTWAPEngine
+	logger              *zap.Logger
+	scheduledOrders     map[string]*TWAPOrder
+	mutex               sync.RWMutex
+	ticker              *time.Ticker
+	workerPool          chan struct{}
+	stopChan            chan struct{}
+	maxConcurrentOrders int
+	executionQueue      chan *ExecutionTask
 }
 
-// Metrics tracks TWAP engine performance metrics
-type Metrics struct {
-	StartTime            time.Time
-	TotalOrders          int64
-	CompletedOrders      int64
-	FailedOrders         int64
-	TotalWindowsExecuted int64
-	FailedWindows        int64
-	AverageExecutionTime time.Duration
-	TotalGasUsed         uint64
-	LastExecutionTime    time.Time
-	mutex                sync.RWMutex
+type ExecutionTask struct {
+	Order  *TWAPOrder
+	Window *ExecutionWindow
+	Retry  int
 }
 
-// NewExecutionScheduler creates a new execution scheduler
-func NewExecutionScheduler(logger *zap.Logger, engine *Engine) *ExecutionScheduler {
-	return &ExecutionScheduler{
-		logger:          logger,
-		engine:          engine,
-		scheduledOrders: make(map[string]*TWAPOrder),
-		ticker:          time.NewTicker(5 * time.Second),
-		workerPool:      make(chan struct{}, MaxConcurrentSwaps),
-		stopChan:        make(chan struct{}),
+const (
+	MaxConcurrentExecutions = 20
+	MaxRetryAttempts       = 3
+	RetryDelay            = 30 * time.Second
+	ExecutionTimeout      = 10 * time.Minute
+	HealthCheckInterval   = 30 * time.Second
+)
+
+func NewTWAPScheduler(logger *zap.Logger, engine *ProductionTWAPEngine) *TWAPScheduler {
+	return &TWAPScheduler{
+		engine:              engine,
+		logger:              logger,
+		scheduledOrders:     make(map[string]*TWAPOrder),
+		ticker:              time.NewTicker(5 * time.Second),
+		workerPool:          make(chan struct{}, MaxConcurrentExecutions),
+		stopChan:            make(chan struct{}),
+		maxConcurrentOrders: MaxConcurrentExecutions,
+		executionQueue:      make(chan *ExecutionTask, 1000),
 	}
 }
 
-// Start begins the execution scheduler main loop
-func (s *ExecutionScheduler) Start(ctx context.Context) {
-	s.logger.Info("Starting TWAP execution scheduler")
-	
+func (s *TWAPScheduler) Start(ctx context.Context) {
+	s.logger.Info("Starting Production TWAP Scheduler",
+		zap.Int("max_concurrent", s.maxConcurrentOrders),
+	)
+
+	// Start worker pool
+	for i := 0; i < s.maxConcurrentOrders; i++ {
+		go s.executionWorker(ctx, i)
+	}
+
+	// Start main scheduler loop
+	go s.schedulerLoop(ctx)
+
+	// Start health monitoring
+	go s.healthMonitor(ctx)
+
 	defer s.ticker.Stop()
 	defer close(s.workerPool)
 	defer close(s.stopChan)
+	defer close(s.executionQueue)
 
+	<-ctx.Done()
+	s.logger.Info("TWAP Scheduler stopped")
+}
+
+func (s *TWAPScheduler) ScheduleOrder(order *TWAPOrder) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.scheduledOrders[order.ID] = order
+	s.logger.Info("TWAP order scheduled",
+		zap.String("order_id", order.ID),
+		zap.Time("start_time", order.StartTime),
+		zap.Int("windows", len(order.ExecutionWindows)),
+		zap.String("total_amount", order.TotalAmount.String()),
+	)
+}
+
+func (s *TWAPScheduler) RemoveOrder(orderID string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	delete(s.scheduledOrders, orderID)
+	s.logger.Info("TWAP order removed from scheduler", zap.String("order_id", orderID))
+}
+
+func (s *TWAPScheduler) schedulerLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("TWAP scheduler stopping")
-			return
-		case <-s.stopChan:
-			s.logger.Info("TWAP scheduler received stop signal")
 			return
 		case <-s.ticker.C:
-			if err := s.checkScheduledExecutions(ctx); err != nil {
-				s.logger.Error("Error checking scheduled executions", zap.Error(err))
-			}
+			s.processScheduledOrders(ctx)
 		}
 	}
 }
 
-// Stop gracefully stops the scheduler
-func (s *ExecutionScheduler) Stop() {
-	select {
-	case s.stopChan <- struct{}{}:
-	default:
-		// Channel is full or closed, which is fine
-	}
-}
-
-// ScheduleOrder adds an order to the execution schedule
-func (s *ExecutionScheduler) ScheduleOrder(order *TWAPOrder) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	
-	s.scheduledOrders[order.ID] = order
-	s.logger.Info("Order scheduled for execution",
-		zap.String("order_id", order.ID),
-		zap.Time("start_time", order.StartTime),
-		zap.Int("intervals", len(order.ExecutionPlan)),
-	)
-}
-
-// RemoveOrder removes an order from the schedule
-func (s *ExecutionScheduler) RemoveOrder(orderID string) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	
-	delete(s.scheduledOrders, orderID)
-	s.logger.Info("Order removed from scheduler",
-		zap.String("order_id", orderID),
-	)
-}
-
-// checkScheduledExecutions checks for ready-to-execute windows
-func (s *ExecutionScheduler) checkScheduledExecutions(ctx context.Context) error {
+func (s *TWAPScheduler) processScheduledOrders(ctx context.Context) {
 	now := time.Now()
-	
+
 	s.mutex.RLock()
 	orders := make([]*TWAPOrder, 0, len(s.scheduledOrders))
 	for _, order := range s.scheduledOrders {
@@ -113,60 +121,51 @@ func (s *ExecutionScheduler) checkScheduledExecutions(ctx context.Context) error
 	}
 	s.mutex.RUnlock()
 
-	var wg sync.WaitGroup
-	
 	for _, order := range orders {
-		// Remove completed or failed orders from schedule
-		if order.Status == OrderStatusCompleted || order.Status == OrderStatusFailed || order.Status == OrderStatusCancelled {
+		// Remove completed or failed orders
+		if order.Status == TWAPOrderStatusCompleted || 
+		   order.Status == TWAPOrderStatusFailed || 
+		   order.Status == TWAPOrderStatusCancelled {
 			s.RemoveOrder(order.ID)
 			continue
 		}
 
 		// Start order execution if it's time
-		if order.Status == OrderStatusPending && now.After(order.StartTime) {
+		if order.Status == TWAPOrderStatusPending && now.After(order.StartTime) {
 			s.engine.ordersMutex.Lock()
-			order.Status = OrderStatusExecuting
+			order.Status = TWAPOrderStatusExecuting
 			s.engine.ordersMutex.Unlock()
-			
-			s.logger.Info("Starting order execution",
+
+			s.logger.Info("Starting TWAP order execution",
 				zap.String("order_id", order.ID),
 				zap.Time("scheduled_start", order.StartTime),
 			)
 		}
 
-		// Check each execution window
-		for _, window := range order.ExecutionPlan {
-			if window.Status != WindowStatusPending {
-				continue
-			}
+		// Process execution windows
+		for _, window := range order.ExecutionWindows {
+			if s.shouldExecuteWindow(window, now) {
+				task := &ExecutionTask{
+					Order:  order,
+					Window: window,
+					Retry:  0,
+				}
 
-			// Check if window is ready for execution
-			if now.After(window.StartTime) && now.Before(window.EndTime) {
-				// Try to acquire a worker from the pool
 				select {
-				case s.workerPool <- struct{}{}:
-					wg.Add(1)
-					go func(o *TWAPOrder, w *ExecutionWindow) {
-						defer wg.Done()
-						defer func() { <-s.workerPool }()
-						
-						s.executeWindowWithLogging(ctx, o, w)
-					}(order, window)
+				case s.executionQueue <- task:
+					window.Status = WindowStatusExecuting
 				default:
-					// Worker pool is full, log and skip this window for now
-					s.logger.Warn("Worker pool full, delaying window execution",
+					s.logger.Warn("Execution queue full, delaying window",
 						zap.String("order_id", order.ID),
 						zap.Int("window", window.Index),
-						zap.Time("window_start", window.StartTime),
 					)
 				}
-			} else if now.After(window.EndTime) {
-				// Window has expired, mark as skipped
+			} else if s.isWindowExpired(window, now) {
 				window.Status = WindowStatusSkipped
-				s.logger.Warn("Window execution window expired",
+				s.logger.Warn("Window execution expired",
 					zap.String("order_id", order.ID),
 					zap.Int("window", window.Index),
-					zap.Time("window_end", window.EndTime),
+					zap.Time("end_time", window.EndTime),
 				)
 			}
 		}
@@ -174,59 +173,453 @@ func (s *ExecutionScheduler) checkScheduledExecutions(ctx context.Context) error
 		// Check if order is complete
 		if s.isOrderComplete(order) {
 			s.engine.ordersMutex.Lock()
-			order.Status = OrderStatusCompleted
+			order.Status = TWAPOrderStatusCompleted
 			s.engine.ordersMutex.Unlock()
-			
-			s.engine.metrics.RecordOrderCompletion(order.ID, true)
-			s.logger.Info("Order completed",
+
+			s.logger.Info("TWAP order completed",
 				zap.String("order_id", order.ID),
 				zap.Int("completed_windows", order.CompletedWindows),
 				zap.Int("total_windows", order.IntervalCount),
 			)
 		}
 	}
-
-	// Wait for all workers to complete before returning
-	wg.Wait()
-	return nil
 }
 
-// executeWindowWithLogging executes a window with proper logging and metrics
-func (s *ExecutionScheduler) executeWindowWithLogging(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) {
-	startTime := time.Now()
-	
-	s.logger.Info("Starting window execution",
-		zap.String("order_id", order.ID),
-		zap.Int("window", window.Index),
-		zap.String("amount", window.Amount.String()),
-	)
+func (s *TWAPScheduler) executionWorker(ctx context.Context, workerID int) {
+	s.logger.Info("Starting TWAP execution worker", zap.Int("worker_id", workerID))
 
-	err := s.engine.executeWindow(ctx, order, window)
-	duration := time.Since(startTime)
-	
-	if err != nil {
-		s.logger.Error("Window execution failed",
-			zap.String("order_id", order.ID),
-			zap.Int("window", window.Index),
-			zap.Duration("duration", duration),
-			zap.Error(err),
-		)
-		s.engine.metrics.RecordWindowFailure(order.ID, window.Index)
-	} else {
-		s.logger.Info("Window execution completed",
-			zap.String("order_id", order.ID),
-			zap.Int("window", window.Index),
-			zap.Duration("duration", duration),
-			zap.Uint64("gas_used", window.GasUsed),
-		)
-		s.engine.metrics.RecordWindowExecution(order.ID, window.Index, duration, window.GasUsed)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task := <-s.executionQueue:
+			s.executeTask(ctx, task, workerID)
+		}
 	}
 }
 
-// isOrderComplete checks if all windows in an order are completed
-func (s *ExecutionScheduler) isOrderComplete(order *TWAPOrder) bool {
+func (s *TWAPScheduler) executeTask(ctx context.Context, task *ExecutionTask, workerID int) {
+	startTime := time.Now()
+
+	s.logger.Info("Worker executing TWAP window",
+		zap.Int("worker_id", workerID),
+		zap.String("order_id", task.Order.ID),
+		zap.Int("window", task.Window.Index),
+		zap.Int("retry", task.Retry),
+		zap.String("amount", task.Window.Amount.String()),
+	)
+
+	// Create execution context with timeout
+	execCtx, cancel := context.WithTimeout(ctx, ExecutionTimeout)
+	defer cancel()
+
+	var err error
+	if s.shouldUseFusionPlus(task.Order, task.Window) {
+		err = s.executeFusionPlusWindow(execCtx, task.Order, task.Window)
+	} else {
+		err = s.executeOrderbookWindow(execCtx, task.Order, task.Window)
+	}
+
+	duration := time.Since(startTime)
+
+	if err != nil {
+		s.handleExecutionError(task, err, duration)
+	} else {
+		s.handleExecutionSuccess(task, duration, workerID)
+	}
+}
+
+func (s *TWAPScheduler) executeFusionPlusWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
+	s.logger.Info("Executing window via Fusion+",
+		zap.String("order_id", order.ID),
+		zap.Int("window", window.Index),
+	)
+
+	// Get Fusion+ quote for this window
+	srcChain := float32(s.engine.chainID)
+	dstChain := float32(1) // Target chain (Cosmos)
+
+	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
+		SrcChain:        srcChain,
+		DstChain:        dstChain,
+		SrcTokenAddress: order.SourceToken,
+		DstTokenAddress: order.DestToken,
+		Amount:          window.Amount.String(),
+		WalletAddress:   order.UserAddress,
+		EnableEstimate:  true,
+	}
+
+	quote, err := s.engine.fusionPlusClient.GetQuote(ctx, quoteParams)
+	if err != nil {
+		return fmt.Errorf("failed to get Fusion+ quote: %w", err)
+	}
+
+	// Get preset and generate secrets
+	preset, err := fusionplus.GetPreset(quote.Presets, quote.RecommendedPreset)
+	if err != nil {
+		return fmt.Errorf("failed to get preset: %w", err)
+	}
+
+	secretsCount := int(preset.SecretsCount)
+	secrets := make([]string, secretsCount)
+	secretHashes := make([]string, secretsCount)
+
+	for i := 0; i < secretsCount; i++ {
+		secret, err := fusionplus.GetRandomBytes32()
+		if err != nil {
+			return fmt.Errorf("failed to generate secret: %w", err)
+		}
+		secrets[i] = secret
+
+		secretHash, err := fusionplus.HashSecret(secret)
+		if err != nil {
+			return fmt.Errorf("failed to hash secret: %w", err)
+		}
+		secretHashes[i] = secretHash
+	}
+
+	// Create hash lock
+	var hashLock *fusionplus.HashLock
+	if secretsCount == 1 {
+		hashLock, err = fusionplus.ForSingleFill(secrets[0])
+	} else {
+		hashLock, err = fusionplus.ForMultipleFills(secrets)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create hash lock: %w", err)
+	}
+
+	// Place Fusion+ order
+	orderParams := fusionplus.OrderParams{
+		HashLock:     hashLock,
+		SecretHashes: secretHashes,
+		Receiver:     order.UserAddress,
+		Preset:       quote.RecommendedPreset,
+	}
+
+	orderHash, err := s.engine.fusionPlusClient.PlaceOrder(ctx, quoteParams, quote, orderParams, s.engine.fusionPlusClient.Wallet)
+	if err != nil {
+		return fmt.Errorf("failed to place Fusion+ order: %w", err)
+	}
+
+	// Update window with Fusion+ order details
+	window.FusionPlusHash = orderHash
+	window.Secret = secrets[0] // Store first secret
+	window.SecretHash = secretHashes[0]
+
+	// Add to order's Fusion+ orders tracking
+	fusionOrderRef := &FusionPlusOrderRef{
+		OrderHash:       orderHash,
+		WindowIndex:     window.Index,
+		Amount:          window.Amount,
+		Status:          "pending",
+		SecretSubmitted: false,
+	}
+	order.FusionPlusOrders = append(order.FusionPlusOrders, fusionOrderRef)
+
+	// Monitor and submit secret when ready
+	go s.monitorFusionPlusOrder(ctx, order, window, fusionOrderRef, secrets[0])
+
+	s.logger.Info("Fusion+ order placed",
+		zap.String("order_id", order.ID),
+		zap.Int("window", window.Index),
+		zap.String("fusion_hash", orderHash),
+	)
+
+	return nil
+}
+
+func (s *TWAPScheduler) executeOrderbookWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
+	s.logger.Info("Executing window via Orderbook",
+		zap.String("order_id", order.ID),
+		zap.Int("window", window.Index),
+	)
+
+	// Get series nonce for orderbook
+	userAddress := common.HexToAddress(order.UserAddress)
+	seriesNonce, err := s.engine.orderbookClient.GetSeriesNonce(ctx, userAddress)
+	if err != nil {
+		return fmt.Errorf("failed to get series nonce: %w", err)
+	}
+
+	// Create maker traits for the order
+	expireAfter := time.Now().Add(time.Hour).Unix()
+	makerTraits, err := orderbook.NewMakerTraits(orderbook.MakerTraitsParams{
+		AllowedSender:      "0x0000000000000000000000000000000000000000",
+		ShouldCheckEpoch:   false,
+		UsePermit2:         false,
+		UnwrapWeth:         false,
+		HasExtension:       false,
+		Expiry:             expireAfter,
+		Nonce:              seriesNonce.Int64(),
+		Series:             0,
+		AllowMultipleFills: true,
+		AllowPartialFills:  true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create maker traits: %w", err)
+	}
+
+	// Calculate taking amount based on expected output
+	takingAmount := s.calculateExpectedOutput(window.Amount, order.SourceToken, order.DestToken)
+
+	// Create orderbook order
+	createOrderResponse, err := s.engine.orderbookClient.CreateOrder(ctx, orderbook.CreateOrderParams{
+		Wallet:                         s.engine.orderbookClient.Wallet,
+		SeriesNonce:                    seriesNonce,
+		ExpireAfterUnix:                expireAfter,
+		Maker:                          order.UserAddress,
+		MakerAsset:                     order.SourceToken,
+		TakerAsset:                     order.DestToken,
+		MakingAmount:                   window.Amount.String(),
+		TakingAmount:                   takingAmount.String(),
+		Taker:                          "0x0000000000000000000000000000000000000000",
+		SkipWarnings:                   false,
+		EnableOnchainApprovalsIfNeeded: false,
+		MakerTraits:                    makerTraits,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create orderbook order: %w", err)
+	}
+
+	if !createOrderResponse.Success {
+		return fmt.Errorf("orderbook order creation failed: %v", createOrderResponse)
+	}
+
+	// Update window with orderbook order details
+	window.OrderbookHash = createOrderResponse.OrderHash
+
+	// Add to order's orderbook orders tracking
+	orderbookOrderRef := &OrderbookOrderRef{
+		OrderHash:   createOrderResponse.OrderHash,
+		WindowIndex: window.Index,
+		Amount:      window.Amount,
+		Status:      "pending",
+		Filled:      big.NewInt(0),
+	}
+	order.OrderbookOrders = append(order.OrderbookOrders, orderbookOrderRef)
+
+	// Monitor orderbook order status
+	go s.monitorOrderbookOrder(ctx, order, window, orderbookOrderRef)
+
+	s.logger.Info("Orderbook order created",
+		zap.String("order_id", order.ID),
+		zap.Int("window", window.Index),
+		zap.String("orderbook_hash", createOrderResponse.OrderHash),
+	)
+
+	return nil
+}
+
+func (s *TWAPScheduler) monitorFusionPlusOrder(ctx context.Context, order *TWAPOrder, window *ExecutionWindow, fusionRef *FusionPlusOrderRef, secret string) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(ExecutionTimeout)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout:
+			s.logger.Warn("Fusion+ order monitoring timeout",
+				zap.String("order_id", order.ID),
+				zap.String("fusion_hash", fusionRef.OrderHash),
+			)
+			return
+		case <-ticker.C:
+			// Check order status
+			fusionOrder, err := s.engine.fusionPlusClient.GetOrderByOrderHash(ctx, fusionplus.GetOrderByOrderHashParams{
+				Hash: fusionRef.OrderHash,
+			})
+			if err != nil {
+				s.logger.Error("Failed to get Fusion+ order status",
+					zap.String("fusion_hash", fusionRef.OrderHash),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			fusionRef.Status = string(fusionOrder.Status)
+
+			// Check for ready fills
+			fills, err := s.engine.fusionPlusClient.GetReadyToAcceptFills(ctx, fusionplus.GetOrderByOrderHashParams{
+				Hash: fusionRef.OrderHash,
+			})
+			if err != nil {
+				s.logger.Error("Failed to get ready fills",
+					zap.String("fusion_hash", fusionRef.OrderHash),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			// Submit secret if fills are ready and not already submitted
+			if len(fills.Fills) > 0 && !fusionRef.SecretSubmitted {
+				err = s.engine.fusionPlusClient.SubmitSecret(ctx, fusionplus.SecretInput{
+					OrderHash: fusionRef.OrderHash,
+					Secret:    secret,
+				})
+				if err != nil {
+					s.logger.Error("Failed to submit secret",
+						zap.String("fusion_hash", fusionRef.OrderHash),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				fusionRef.SecretSubmitted = true
+				s.logger.Info("Secret submitted for Fusion+ order",
+					zap.String("order_id", order.ID),
+					zap.String("fusion_hash", fusionRef.OrderHash),
+				)
+
+				// Create corresponding Cosmos escrow
+				if err := s.createCosmosEscrow(ctx, order, window); err != nil {
+					s.logger.Error("Failed to create Cosmos escrow",
+						zap.String("order_id", order.ID),
+						zap.Error(err),
+					)
+				}
+			}
+
+			// Check if order is executed
+			if string(fusionOrder.Status) == "executed" {
+				window.Status = WindowStatusCompleted
+				s.engine.ordersMutex.Lock()
+				order.CompletedWindows++
+				order.TotalExecuted.Add(order.TotalExecuted, window.Amount)
+				s.engine.ordersMutex.Unlock()
+
+				s.logger.Info("Fusion+ window execution completed",
+					zap.String("order_id", order.ID),
+					zap.Int("window", window.Index),
+				)
+				return
+			}
+		}
+	}
+}
+
+func (s *TWAPScheduler) monitorOrderbookOrder(ctx context.Context, order *TWAPOrder, window *ExecutionWindow, orderbookRef *OrderbookOrderRef) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(ExecutionTimeout)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout:
+			s.logger.Warn("Orderbook order monitoring timeout",
+				zap.String("order_id", order.ID),
+				zap.String("orderbook_hash", orderbookRef.OrderHash),
+			)
+			return
+		case <-ticker.C:
+			// Check order status by fetching orders for the user
+			orders, err := s.engine.orderbookClient.GetOrdersByCreatorAddress(ctx, orderbook.GetOrdersByCreatorAddressParams{
+				CreatorAddress: order.UserAddress,
+			})
+			if err != nil {
+				s.logger.Error("Failed to get orderbook orders",
+					zap.String("orderbook_hash", orderbookRef.OrderHash),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			// Find our specific order
+			var foundOrder *orderbook.Order
+			for _, ord := range orders {
+				if ord.OrderHash == orderbookRef.OrderHash {
+					foundOrder = &ord
+					break
+				}
+			}
+
+			if foundOrder != nil {
+				orderbookRef.Status = foundOrder.Status
+				
+				// Parse filled amount
+				if filledAmount, ok := new(big.Int).SetString(foundOrder.FilledMakingAmount, 10); ok {
+					orderbookRef.Filled = filledAmount
+				}
+
+				// Check if order is fully filled
+				if foundOrder.Status == "filled" || orderbookRef.Filled.Cmp(window.Amount) >= 0 {
+					window.Status = WindowStatusCompleted
+					s.engine.ordersMutex.Lock()
+					order.CompletedWindows++
+					order.TotalExecuted.Add(order.TotalExecuted, window.Amount)
+					s.engine.ordersMutex.Unlock()
+
+					s.logger.Info("Orderbook window execution completed",
+						zap.String("order_id", order.ID),
+						zap.Int("window", window.Index),
+						zap.String("filled_amount", orderbookRef.Filled.String()),
+					)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *TWAPScheduler) createCosmosEscrow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
+	// Create Cosmos escrow for cross-chain completion
+	params := s.engine.cosmosClient.CreateEscrowParams{
+		EthereumTxHash: window.FusionPlusHash,
+		SecretHash:     window.SecretHash,
+		TimeLock:       uint64(time.Now().Add(24 * time.Hour).Unix()),
+		Recipient:      order.UserAddress,
+		EthereumSender: s.engine.publicAddress.Hex(),
+		Amount:         window.Amount,
+	}
+
+	txHash, err := s.engine.cosmosClient.CreateEscrow(ctx, params)
+	if err != nil {
+		return fmt.Errorf("failed to create Cosmos escrow: %w", err)
+	}
+
+	window.CosmosTxHash = txHash
+	s.logger.Info("Created Cosmos escrow for TWAP window",
+		zap.String("order_id", order.ID),
+		zap.Int("window", window.Index),
+		zap.String("cosmos_tx", txHash),
+	)
+
+	return nil
+}
+
+func (s *TWAPScheduler) calculateExpectedOutput(inputAmount *big.Int, srcToken, dstToken string) *big.Int {
+	// Simple calculation - in production, use proper price feeds
+	// This is a placeholder that assumes 1:1 ratio
+	return new(big.Int).Set(inputAmount)
+}
+
+func (s *TWAPScheduler) shouldUseFusionPlus(order *TWAPOrder, window *ExecutionWindow) bool {
+	// Decision logic for execution method
+	// Use Fusion+ for larger amounts or when cross-chain is involved
+	threshold := big.NewInt(1000000) // 1M units threshold
+	return window.Amount.Cmp(threshold) > 0 || 
+		   order.SourceChain != order.DestChain
+}
+
+func (s *TWAPScheduler) shouldExecuteWindow(window *ExecutionWindow, now time.Time) bool {
+	return window.Status == WindowStatusPending && 
+		   now.After(window.StartTime) && 
+		   now.Before(window.EndTime)
+}
+
+func (s *TWAPScheduler) isWindowExpired(window *ExecutionWindow, now time.Time) bool {
+	return window.Status == WindowStatusPending && now.After(window.EndTime)
+}
+
+func (s *TWAPScheduler) isOrderComplete(order *TWAPOrder) bool {
 	completedCount := 0
-	for _, window := range order.ExecutionPlan {
+	for _, window := range order.ExecutionWindows {
 		if window.Status == WindowStatusCompleted {
 			completedCount++
 		}
@@ -234,143 +627,120 @@ func (s *ExecutionScheduler) isOrderComplete(order *TWAPOrder) bool {
 	return completedCount >= order.IntervalCount
 }
 
-// GetScheduledOrderCount returns the number of currently scheduled orders
-func (s *ExecutionScheduler) GetScheduledOrderCount() int {
+func (s *TWAPScheduler) handleExecutionError(task *ExecutionTask, err error, duration time.Duration) {
+	s.logger.Error("TWAP window execution failed",
+		zap.String("order_id", task.Order.ID),
+		zap.Int("window", task.Window.Index),
+		zap.Int("retry", task.Retry),
+		zap.Duration("duration", duration),
+		zap.Error(err),
+	)
+
+	// Retry logic
+	if task.Retry < MaxRetryAttempts {
+		task.Retry++
+		task.Window.Status = WindowStatusPending // Reset to pending for retry
+
+		// Schedule retry with delay
+		go func() {
+			time.Sleep(RetryDelay)
+			select {
+			case s.executionQueue <- task:
+			default:
+				s.logger.Error("Failed to schedule retry, queue full",
+					zap.String("order_id", task.Order.ID),
+					zap.Int("window", task.Window.Index),
+				)
+			}
+		}()
+
+		s.logger.Info("Scheduled retry for failed window",
+			zap.String("order_id", task.Order.ID),
+			zap.Int("window", task.Window.Index),
+			zap.Int("retry", task.Retry),
+		)
+	} else {
+		// Mark window as failed after max retries
+		task.Window.Status = WindowStatusFailed
+		s.logger.Error("Window permanently failed after max retries",
+			zap.String("order_id", task.Order.ID),
+			zap.Int("window", task.Window.Index),
+			zap.Int("max_retries", MaxRetryAttempts),
+		)
+	}
+}
+
+func (s *TWAPScheduler) handleExecutionSuccess(task *ExecutionTask, duration time.Duration, workerID int) {
+	executedAt := time.Now()
+	task.Window.ExecutedAt = &executedAt
+
+	s.logger.Info("TWAP window execution successful",
+		zap.Int("worker_id", workerID),
+		zap.String("order_id", task.Order.ID),
+		zap.Int("window", task.Window.Index),
+		zap.Duration("duration", duration),
+		zap.String("amount", task.Window.Amount.String()),
+	)
+}
+
+func (s *TWAPScheduler) healthMonitor(ctx context.Context) {
+	ticker := time.NewTicker(HealthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.performHealthCheck()
+		}
+	}
+}
+
+func (s *TWAPScheduler) performHealthCheck() {
+	s.mutex.RLock()
+	orderCount := len(s.scheduledOrders)
+	queueSize := len(s.executionQueue)
+	s.mutex.RUnlock()
+
+	s.logger.Debug("TWAP Scheduler health check",
+		zap.Int("scheduled_orders", orderCount),
+		zap.Int("queue_size", queueSize),
+		zap.Int("max_queue", cap(s.executionQueue)),
+	)
+
+	// Alert if queue is nearly full
+	if queueSize > cap(s.executionQueue)*80/100 {
+		s.logger.Warn("Execution queue is nearly full",
+			zap.Int("current_size", queueSize),
+			zap.Int("max_size", cap(s.executionQueue)),
+		)
+	}
+}
+
+func (s *TWAPScheduler) GetScheduledOrderCount() int {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return len(s.scheduledOrders)
 }
 
-// GetScheduledOrders returns a copy of currently scheduled orders
-func (s *ExecutionScheduler) GetScheduledOrders() map[string]*TWAPOrder {
+func (s *TWAPScheduler) GetQueueSize() int {
+	return len(s.executionQueue)
+}
+
+func (s *TWAPScheduler) GetSchedulerMetrics() map[string]interface{} {
 	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	
-	orders := make(map[string]*TWAPOrder, len(s.scheduledOrders))
-	for id, order := range s.scheduledOrders {
-		orders[id] = order
-	}
-	return orders
-}
+	orderCount := len(s.scheduledOrders)
+	s.mutex.RUnlock()
 
-// NewMetrics creates a new metrics instance
-func NewMetrics() *Metrics {
-	return &Metrics{
-		StartTime: time.Now(),
-	}
-}
+	queueSize := len(s.executionQueue)
+	queueCapacity := cap(s.executionQueue)
 
-// RecordOrderScheduled increments the total orders counter
-func (m *Metrics) RecordOrderScheduled() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.TotalOrders++
-}
-
-// RecordWindowExecution records a successful window execution
-func (m *Metrics) RecordWindowExecution(orderID string, windowIndex int, duration time.Duration, gasUsed uint64) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	
-	m.TotalWindowsExecuted++
-	m.TotalGasUsed += gasUsed
-	m.LastExecutionTime = time.Now()
-	
-	// Update average execution time using a running average
-	if m.TotalWindowsExecuted == 1 {
-		m.AverageExecutionTime = duration
-	} else {
-		// Calculate weighted average
-		totalTime := int64(m.AverageExecutionTime) * (m.TotalWindowsExecuted - 1)
-		m.AverageExecutionTime = time.Duration((totalTime + int64(duration)) / m.TotalWindowsExecuted)
-	}
-}
-
-// RecordWindowFailure records a failed window execution
-func (m *Metrics) RecordWindowFailure(orderID string, windowIndex int) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	
-	m.FailedWindows++
-}
-
-// RecordOrderCompletion records order completion or failure
-func (m *Metrics) RecordOrderCompletion(orderID string, success bool) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	
-	if success {
-		m.CompletedOrders++
-	} else {
-		m.FailedOrders++
-	}
-}
-
-// GetSummary returns a summary of current metrics
-func (m *Metrics) GetSummary() map[string]interface{} {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	
-	successRate := float64(0)
-	if m.TotalOrders > 0 {
-		successRate = float64(m.CompletedOrders) / float64(m.TotalOrders) * 100
-	}
-	
-	windowSuccessRate := float64(0)
-	if m.TotalWindowsExecuted+m.FailedWindows > 0 {
-		windowSuccessRate = float64(m.TotalWindowsExecuted) / float64(m.TotalWindowsExecuted+m.FailedWindows) * 100
-	}
-	
 	return map[string]interface{}{
-		"total_orders":           m.TotalOrders,
-		"completed_orders":       m.CompletedOrders,
-		"failed_orders":          m.FailedOrders,
-		"order_success_rate":     successRate,
-		"total_windows_executed": m.TotalWindowsExecuted,
-		"failed_windows":         m.FailedWindows,
-		"window_success_rate":    windowSuccessRate,
-		"avg_execution_time":     m.AverageExecutionTime.String(),
-		"total_gas_used":         m.TotalGasUsed,
-		"last_execution":         m.LastExecutionTime.Format(time.RFC3339),
-		"uptime":                 time.Since(m.StartTime).String(),
+		"scheduled_orders":    orderCount,
+		"queue_size":         queueSize,
+		"queue_capacity":     queueCapacity,
+		"queue_utilization":  float64(queueSize) / float64(queueCapacity) * 100,
+		"max_concurrent":     s.maxConcurrentOrders,
 	}
-}
-
-// GetDetailedMetrics returns detailed metrics for monitoring
-func (m *Metrics) GetDetailedMetrics() map[string]interface{} {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	
-	summary := m.GetSummary()
-	
-	// Add more detailed information
-	summary["start_time"] = m.StartTime.Format(time.RFC3339)
-	summary["avg_execution_seconds"] = m.AverageExecutionTime.Seconds()
-	summary["uptime_seconds"] = time.Since(m.StartTime).Seconds()
-	
-	// Calculate rates
-	uptimeHours := time.Since(m.StartTime).Hours()
-	if uptimeHours > 0 {
-		summary["orders_per_hour"] = float64(m.TotalOrders) / uptimeHours
-		summary["windows_per_hour"] = float64(m.TotalWindowsExecuted) / uptimeHours
-		summary["gas_per_hour"] = float64(m.TotalGasUsed) / uptimeHours
-	}
-	
-	return summary
-}
-
-// Reset resets all metrics (useful for testing)
-func (m *Metrics) Reset() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	
-	m.StartTime = time.Now()
-	m.TotalOrders = 0
-	m.CompletedOrders = 0
-	m.FailedOrders = 0
-	m.TotalWindowsExecuted = 0
-	m.FailedWindows = 0
-	m.AverageExecutionTime = 0
-	m.TotalGasUsed = 0
-	m.LastExecutionTime = time.Time{}
 }

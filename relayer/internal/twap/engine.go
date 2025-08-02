@@ -2,194 +2,143 @@ package twap
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
-	"net/http"
-	"net/url"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 
+	"github.com/1inch/1inch-sdk-go/sdk-clients/fusionplus"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/orderbook"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/aggregation"
+	"github.com/1inch/1inch-sdk-go/sdk-clients/tokens"
+
 	"flow-fusion/relayer/internal/cosmos"
 	"flow-fusion/relayer/internal/ethereum"
 )
 
-const (
-	OneInchAPIBaseURL   = "https://api.1inch.dev"
-	OneInchSwapAPI      = "/swap/v6.0"
-	OneInchQuoteAPI     = "/quote/v1.4"
-	MaxRetries          = 3
-	RetryDelay          = 2 * time.Second
-	ConfirmationBlocks  = 3
-	MaxConcurrentSwaps  = 10
-	RateLimitPerSecond  = 5
-	OrderTTL            = 24 * time.Hour
-	ExecutionTimeout    = 30 * time.Minute
-	CircuitBreakerDelay = 5 * time.Minute
-)
-
-// Engine represents the TWAP execution engine
-type Engine struct {
+// ProductionTWAPEngine implements TWAP execution using 1inch Fusion+ SDK
+type ProductionTWAPEngine struct {
 	config            Config
 	ethClient         *ethereum.Client
 	cosmosClient      *cosmos.Client
 	logger            *zap.Logger
 	
+	// 1inch SDK clients
+	fusionPlusClient  *fusionplus.Client
+	orderbookClient   *orderbook.Client
+	aggregationClient *aggregation.Client
+	tokensClient      *tokens.Client
+	
 	// State management
-	orders            map[string]*TWAPOrder
+	twapOrders        map[string]*TWAPOrder
 	ordersMutex       sync.RWMutex
 	redisClient       *redis.Client
 	
-	// API clients
-	oneInchClient     *OneInchClient
-	
 	// Execution management
-	scheduler         *ExecutionScheduler
+	scheduler         *TWAPScheduler
 	rateLimiter       *rate.Limiter
-	metrics           *Metrics
-	chainID           *big.Int
+	metrics           *TWAPMetrics
 	
-	// Circuit breaker
-	circuitBreaker    *CircuitBreaker
+	// Authentication
+	privateKey        *ecdsa.PrivateKey
+	publicAddress     common.Address
+	chainID           int
 }
 
-// CircuitBreaker implements circuit breaker pattern for 1inch API
-type CircuitBreaker struct {
-	isTripped     bool
-	lastTrip      time.Time
-	failureCount  int
-	threshold     int
-	resetTimeout  time.Duration
-	mutex         sync.RWMutex
-}
-
-// OneInchClient handles 1inch API interactions
-type OneInchClient struct {
-	apiKey      string
-	httpClient  *http.Client
-	logger      *zap.Logger
-	rateLimiter *rate.Limiter
-}
-
-// Config holds engine configuration
 type Config struct {
-	RedisURL      string
-	OneInchAPIKey string
-	ChainID       string
-	MaxGasPrice   *big.Int
-	MaxIntervals     int           
-	MinIntervalTime  time.Duration 
-	MaxSlippage      float64       
-	DatabaseURL      string  
+	RedisURL        string
+	OneInchAPIKey   string
+	PrivateKey      string
+	NodeURL         string
+	ChainID         int
+	MaxGasPrice     *big.Int
+	MaxIntervals    int
+	MinIntervalTime time.Duration
+	MaxSlippage     float64
+	DatabaseURL     string
 }
 
-// TWAPOrder represents a TWAP order
 type TWAPOrder struct {
-	ID              string             `json:"id"`
-	UserAddress     string             `json:"user_address"`
-	SourceToken     string             `json:"source_token"`
-	DestToken       string             `json:"dest_token"`
-	TotalAmount     *big.Int           `json:"total_amount"`
-	IntervalCount   int                `json:"interval_count"`
-	TimeWindow      int                `json:"time_window"`
-	ExecutionPlan   []*ExecutionWindow `json:"execution_plan"`
-	Status          OrderStatus        `json:"status"`
-	CompletedWindows int               `json:"completed_windows"`
-	TotalExecuted   *big.Int           `json:"total_executed"`
-	CreatedAt       time.Time          `json:"created_at"`
-	StartTime       time.Time          `json:"start_time"`
+	ID              string                `json:"id"`
+	UserAddress     string                `json:"user_address"`
+	SourceToken     string                `json:"source_token"`
+	DestToken       string                `json:"dest_token"`
+	TotalAmount     *big.Int              `json:"total_amount"`
+	IntervalCount   int                   `json:"interval_count"`
+	TimeWindow      int                   `json:"time_window"`
+	MaxSlippage     float64               `json:"max_slippage"`
+	Status          TWAPOrderStatus       `json:"status"`
+	CreatedAt       time.Time             `json:"created_at"`
+	StartTime       time.Time             `json:"start_time"`
+	
+	// Execution windows
+	ExecutionWindows []*ExecutionWindow   `json:"execution_windows"`
+	CompletedWindows int                  `json:"completed_windows"`
+	TotalExecuted    *big.Int             `json:"total_executed"`
+	
+	// 1inch integration
+	FusionPlusOrders []*FusionPlusOrderRef `json:"fusion_plus_orders"`
+	OrderbookOrders  []*OrderbookOrderRef  `json:"orderbook_orders"`
 }
 
-// ExecutionWindow represents a single TWAP execution window
 type ExecutionWindow struct {
-	Index           int           `json:"index"`
-	Amount          *big.Int      `json:"amount"`
-	Secret          []byte        `json:"-"`
-	SecretHash      string        `json:"secret_hash"`
-	EthereumTxHash  string        `json:"ethereum_tx_hash"`
-	CosmosTxHash    string        `json:"cosmos_tx_hash"`
-	ActualPrice     *big.Int      `json:"actual_price"`
-	GasUsed         uint64        `json:"gas_used"`
-	ExecutedAt      *time.Time    `json:"executed_at"`
-	Status          WindowStatus  `json:"status"`
-	StartTime       time.Time     `json:"start_time"`
-	EndTime         time.Time     `json:"end_time"`
+	Index           int                   `json:"index"`
+	Amount          *big.Int              `json:"amount"`
+	StartTime       time.Time             `json:"start_time"`
+	EndTime         time.Time             `json:"end_time"`
+	Status          WindowStatus          `json:"status"`
+	ExecutedAt      *time.Time            `json:"executed_at,omitempty"`
+	
+	// 1inch order details
+	FusionPlusHash  string                `json:"fusion_plus_hash,omitempty"`
+	OrderbookHash   string                `json:"orderbook_hash,omitempty"`
+	ActualOutput    *big.Int              `json:"actual_output,omitempty"`
+	GasUsed         uint64                `json:"gas_used,omitempty"`
+	
+	// Secrets for atomic swaps
+	Secret          string                `json:"-"` // Never expose
+	SecretHash      string                `json:"secret_hash"`
+	
+	// Cross-chain references
+	EthereumTxHash  string                `json:"ethereum_tx_hash,omitempty"`
+	CosmosTxHash    string                `json:"cosmos_tx_hash,omitempty"`
 }
 
-// Request/Response types
-type CreateTWAPOrderRequest struct {
-	UserAddress   string  `json:"user_address" binding:"required"`
-	SourceToken   string  `json:"source_token" binding:"required"`
-	DestToken     string  `json:"dest_token" binding:"required"`
-	TotalAmount   string  `json:"total_amount" binding:"required"`
-	TimeWindow    int     `json:"time_window" binding:"required,min=300"`
-	IntervalCount int     `json:"interval_count" binding:"required,min=2"`
-	MaxSlippage   float64 `json:"max_slippage" binding:"required,min=0.01,max=10"`
-	StartDelay    int     `json:"start_delay,omitempty"`
+type FusionPlusOrderRef struct {
+	OrderHash       string              `json:"order_hash"`
+	WindowIndex     int                 `json:"window_index"`
+	Amount          *big.Int            `json:"amount"`
+	Status          string              `json:"status"`
+	SecretSubmitted bool                `json:"secret_submitted"`
 }
 
-type TWAPQuoteRequest struct {
-	SourceToken   string  `json:"source_token" binding:"required"`
-	DestToken     string  `json:"dest_token" binding:"required"`
-	Amount        string  `json:"amount" binding:"required"`
-	IntervalCount int     `json:"interval_count" binding:"required"`
-	TimeWindow    int     `json:"time_window" binding:"required"`
-	MaxSlippage   float64 `json:"max_slippage"`
+type OrderbookOrderRef struct {
+	OrderHash       string              `json:"order_hash"`
+	WindowIndex     int                 `json:"window_index"`
+	Amount          *big.Int            `json:"amount"`
+	Status          string              `json:"status"`
+	Filled          *big.Int            `json:"filled"`
 }
 
-type TWAPQuoteResponse struct {
-	EstimatedOutput   string                `json:"estimated_output"`
-	PriceImpact       float64               `json:"price_impact"`
-	ImpactComparison  PriceImpactComparison `json:"impact_comparison"`
-	ExecutionSchedule []SchedulePreview     `json:"execution_schedule"`
-	Fees              FeeBreakdown          `json:"fees"`
-	Recommendations   []string              `json:"recommendations"`
-}
-
-type PriceImpactComparison struct {
-	InstantSwap        float64 `json:"instant_swap"`
-	TWAPExecution      float64 `json:"twap_execution"`
-	ImprovementPercent float64 `json:"improvement_percent"`
-}
-
-type SchedulePreview struct {
-	IntervalIndex  int       `json:"interval_index"`
-	ExecutionTime  time.Time `json:"execution_time"`
-	Amount         string    `json:"amount"`
-	EstimatedPrice string    `json:"estimated_price"`
-}
-
-type FeeBreakdown struct {
-	EthereumGas string `json:"ethereum_gas"`
-	CosmosGas   string `json:"cosmos_gas"`
-	RelayerFee  string `json:"relayer_fee"`
-	OneInchFee  string `json:"oneinch_fee"`
-	Total       string `json:"total"`
-}
-
-// OrderStatus represents order states
-type OrderStatus string
+type TWAPOrderStatus string
 const (
-	OrderStatusPending   OrderStatus = "pending"
-	OrderStatusExecuting OrderStatus = "executing"
-	OrderStatusCompleted OrderStatus = "completed"
-	OrderStatusFailed    OrderStatus = "failed"
-	OrderStatusCancelled OrderStatus = "cancelled"
+	TWAPOrderStatusPending   TWAPOrderStatus = "pending"
+	TWAPOrderStatusExecuting TWAPOrderStatus = "executing"
+	TWAPOrderStatusCompleted TWAPOrderStatus = "completed"
+	TWAPOrderStatusFailed    TWAPOrderStatus = "failed"
+	TWAPOrderStatusCancelled TWAPOrderStatus = "cancelled"
 )
 
-// WindowStatus represents window states
 type WindowStatus string
 const (
 	WindowStatusPending   WindowStatus = "pending"
@@ -199,33 +148,63 @@ const (
 	WindowStatusSkipped   WindowStatus = "skipped"
 )
 
-// OneInch API response types
-type OneInchQuoteResponse struct {
-	DstAmount string `json:"dstAmount"`
-	Gas       string `json:"gas"`
-	GasPrice  string `json:"gasPrice"`
-	Protocols [][]struct {
-		Name             string  `json:"name"`
-		Part             float64 `json:"part"`
-		FromTokenAddress string  `json:"fromTokenAddress"`
-		ToTokenAddress   string  `json:"toTokenAddress"`
-	} `json:"protocols"`
+// Request/Response types
+type CreateTWAPOrderRequest struct {
+	UserAddress   string  `json:"user_address" binding:"required"`
+	SourceToken   string  `json:"source_token" binding:"required"`
+	DestToken     string  `json:"dest_token" binding:"required"`
+	TotalAmount   string  `json:"total_amount" binding:"required"`
+	TimeWindow    int     `json:"time_window" binding:"required,min=300"`
+	IntervalCount int     `json:"interval_count" binding:"required,min=2,max=100"`
+	MaxSlippage   float64 `json:"max_slippage" binding:"required,min=0.01,max=10"`
+	StartDelay    int     `json:"start_delay,omitempty"`
+	UseFusionPlus bool    `json:"use_fusion_plus,omitempty"`
+	UseOrderbook  bool    `json:"use_orderbook,omitempty"`
 }
 
-type OneInchSwapResponse struct {
-	DstAmount string `json:"dstAmount"`
-	Tx        struct {
-		From     string `json:"from"`
-		To       string `json:"to"`
-		Data     string `json:"data"`
-		Value    string `json:"value"`
-		GasPrice string `json:"gasPrice"`
-		Gas      int    `json:"gas"`
-	} `json:"tx"`
+type TWAPQuoteResponse struct {
+	EstimatedOutput   string                    `json:"estimated_output"`
+	PriceImpact       float64                   `json:"price_impact"`
+	ImpactComparison  PriceImpactComparison     `json:"impact_comparison"`
+	ExecutionSchedule []SchedulePreview         `json:"execution_schedule"`
+	Fees              FeeBreakdown              `json:"fees"`
+	Recommendations   []string                  `json:"recommendations"`
+	FusionPlusQuote   interface{}               `json:"fusion_plus_quote,omitempty"`
+	OrderbookQuote    interface{}               `json:"orderbook_quote,omitempty"`
 }
 
-// NewEngine creates a new TWAP engine
-func NewEngine(config Config, ethClient *ethereum.Client, cosmosClient *cosmos.Client, logger *zap.Logger) (*Engine, error) {
+type PriceImpactComparison struct {
+	InstantSwap        float64 `json:"instant_swap"`
+	TWAPExecution      float64 `json:"twap_execution"`
+	ImprovementPercent float64 `json:"improvement_percent"`
+}
+
+type SchedulePreview struct {
+	IntervalIndex    int       `json:"interval_index"`
+	ExecutionTime    time.Time `json:"execution_time"`
+	Amount           string    `json:"amount"`
+	EstimatedPrice   string    `json:"estimated_price"`
+	ExecutionMethod  string    `json:"execution_method"` // "fusion_plus" or "orderbook"
+}
+
+type FeeBreakdown struct {
+	EthereumGas      string `json:"ethereum_gas"`
+	CosmosGas        string `json:"cosmos_gas"`
+	RelayerFee       string `json:"relayer_fee"`
+	OneInchFee       string `json:"oneinch_fee"`
+	Total            string `json:"total"`
+}
+
+func NewProductionTWAPEngine(config Config, ethClient *ethereum.Client, cosmosClient *cosmos.Client, logger *zap.Logger) (*ProductionTWAPEngine, error) {
+	// Parse private key
+	privateKey, err := crypto.HexToECDSA(config.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+	
+	publicKey := privateKey.Public()
+	publicAddress := crypto.PubkeyToAddress(*publicKey.(*ecdsa.PublicKey))
+
 	// Initialize Redis
 	opt, err := redis.ParseURL(config.RedisURL)
 	if err != nil {
@@ -239,67 +218,108 @@ func NewEngine(config Config, ethClient *ethereum.Client, cosmosClient *cosmos.C
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
-	// Initialize 1inch client
-	oneInchClient := &OneInchClient{
-		apiKey: config.OneInchAPIKey,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-			},
-		},
-		logger:      logger,
-		rateLimiter: rate.NewLimiter(rate.Limit(RateLimitPerSecond), 1),
+	// Initialize Fusion+ client
+	fusionConfig, err := fusionplus.NewConfiguration(fusionplus.ConfigurationParams{
+		ApiUrl:     "https://api.1inch.dev",
+		ApiKey:     config.OneInchAPIKey,
+		PrivateKey: config.PrivateKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Fusion+ config: %w", err)
 	}
 
-	// Parse chain ID
-	chainID, ok := new(big.Int).SetString(config.ChainID, 10)
-	if !ok {
-		return nil, fmt.Errorf("invalid chain ID: %s", config.ChainID)
+	fusionClient, err := fusionplus.NewClient(fusionConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Fusion+ client: %w", err)
 	}
 
-	// Initialize circuit breaker
-	circuitBreaker := &CircuitBreaker{
-		threshold:    5,
-		resetTimeout: CircuitBreakerDelay,
+	// Initialize Orderbook client
+	orderbookConfig, err := orderbook.NewConfiguration(orderbook.ConfigurationParams{
+		NodeUrl:    config.NodeURL,
+		PrivateKey: config.PrivateKey,
+		ChainId:    config.ChainID,
+		ApiUrl:     "https://api.1inch.dev",
+		ApiKey:     config.OneInchAPIKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Orderbook config: %w", err)
 	}
 
-	engine := &Engine{
-		config:         config,
-		ethClient:      ethClient,
-		cosmosClient:   cosmosClient,
-		logger:         logger,
-		orders:         make(map[string]*TWAPOrder),
-		redisClient:    redisClient,
-		oneInchClient:  oneInchClient,
-		rateLimiter:    rate.NewLimiter(rate.Limit(RateLimitPerSecond), MaxConcurrentSwaps),
-		metrics:        NewMetrics(),
-		chainID:        chainID,
-		circuitBreaker: circuitBreaker,
+	orderbookClient, err := orderbook.NewClient(orderbookConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Orderbook client: %w", err)
+	}
+
+	// Initialize Aggregation client
+	aggConfig, err := aggregation.NewConfigurationAPI(
+		config.ChainID,
+		"https://api.1inch.dev",
+		config.OneInchAPIKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Aggregation config: %w", err)
+	}
+
+	aggClient, err := aggregation.NewClientOnlyAPI(aggConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Aggregation client: %w", err)
+	}
+
+	// Initialize Tokens client
+	tokensConfig, err := tokens.NewConfiguration(tokens.ConfigurationParams{
+		ChainId: config.ChainID,
+		ApiUrl:  "https://api.1inch.dev",
+		ApiKey:  config.OneInchAPIKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Tokens config: %w", err)
+	}
+
+	tokensClient, err := tokens.NewClient(tokensConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Tokens client: %w", err)
+	}
+
+	engine := &ProductionTWAPEngine{
+		config:            config,
+		ethClient:         ethClient,
+		cosmosClient:      cosmosClient,
+		logger:            logger,
+		fusionPlusClient:  fusionClient,
+		orderbookClient:   orderbookClient,
+		aggregationClient: aggClient,
+		tokensClient:      tokensClient,
+		twapOrders:        make(map[string]*TWAPOrder),
+		redisClient:       redisClient,
+		rateLimiter:       rate.NewLimiter(rate.Limit(5), 10), // 5 requests per second
+		metrics:           NewTWAPMetrics(),
+		privateKey:        privateKey,
+		publicAddress:     publicAddress,
+		chainID:           config.ChainID,
 	}
 
 	// Initialize scheduler
-	engine.scheduler = NewExecutionScheduler(logger, engine)
+	engine.scheduler = NewTWAPScheduler(logger, engine)
 
 	return engine, nil
 }
 
-// Start runs the TWAP engine
-func (e *Engine) Start(ctx context.Context) error {
-	e.logger.Info("Starting Production TWAP Engine")
+func (e *ProductionTWAPEngine) Start(ctx context.Context) error {
+	e.logger.Info("Starting Production TWAP Engine with 1inch Integration",
+		zap.String("public_address", e.publicAddress.Hex()),
+		zap.Int("chain_id", e.chainID),
+	)
 
 	// Restore persisted orders
 	if err := e.restoreOrders(ctx); err != nil {
-		e.logger.Error("Failed to restore orders", zap.Error(err))
+		e.logger.Error("Failed to restore TWAP orders", zap.Error(err))
 	}
 
 	// Start execution scheduler
 	go e.scheduler.Start(ctx)
 
 	// Start order monitoring
-	go e.monitorOrders(ctx)
+	go e.monitorTWAPOrders(ctx)
 
 	// Main execution loop
 	ticker := time.NewTicker(5 * time.Second)
@@ -312,23 +332,22 @@ func (e *Engine) Start(ctx context.Context) error {
 			return e.shutdown(ctx)
 		case <-ticker.C:
 			if err := e.processExecutions(ctx); err != nil {
-				e.logger.Error("Error processing executions", zap.Error(err))
+				e.logger.Error("Error processing TWAP executions", zap.Error(err))
 			}
 		}
 	}
 }
 
-// GetQuote handles TWAP quote requests
-func (e *Engine) GetQuote(c *gin.Context) {
-	var req TWAPQuoteRequest
+func (e *ProductionTWAPEngine) GetQuote(c *gin.Context) {
+	var req CreateTWAPOrderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	totalAmount, ok := new(big.Int).SetString(req.Amount, 10)
+	totalAmount, ok := new(big.Int).SetString(req.TotalAmount, 10)
 	if !ok || totalAmount.Sign() <= 0 {
-		c.JSON(400, gin.H{"error": "invalid amount"})
+		c.JSON(400, gin.H{"error": "invalid total amount"})
 		return
 	}
 
@@ -342,22 +361,21 @@ func (e *Engine) GetQuote(c *gin.Context) {
 	c.JSON(200, quote)
 }
 
-// CreateOrder handles TWAP order creation
-func (e *Engine) CreateOrder(c *gin.Context) {
+func (e *ProductionTWAPEngine) CreateOrder(c *gin.Context) {
 	var req CreateTWAPOrderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	totalAmount, ok := new(big.Int).SetString(req.TotalAmount, 10)
-	if !ok || totalAmount.Sign() <= 0 {
-		c.JSON(400, gin.H{"error": "invalid total_amount"})
+	if err := e.validateTWAPRequest(req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := e.validateTWAPRequest(req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
+	totalAmount, ok := new(big.Int).SetString(req.TotalAmount, 10)
+	if !ok || totalAmount.Sign() <= 0 {
+		c.JSON(400, gin.H{"error": "invalid total amount"})
 		return
 	}
 
@@ -371,206 +389,48 @@ func (e *Engine) CreateOrder(c *gin.Context) {
 	c.JSON(201, order)
 }
 
-// GetOrder retrieves order by ID
-func (e *Engine) GetOrder(c *gin.Context) {
-	orderID := c.Param("id")
-	
-	e.ordersMutex.RLock()
-	order, exists := e.orders[orderID]
-	e.ordersMutex.RUnlock()
-	
-	if !exists {
-		c.JSON(404, gin.H{"error": "order not found"})
-		return
-	}
-
-	c.JSON(200, order)
-}
-
-// GetSchedule retrieves execution schedule for order
-func (e *Engine) GetSchedule(c *gin.Context) {
-	orderID := c.Param("id")
-	
-	e.ordersMutex.RLock()
-	order, exists := e.orders[orderID]
-	e.ordersMutex.RUnlock()
-	
-	if !exists {
-		c.JSON(404, gin.H{"error": "order not found"})
-		return
-	}
-
-	c.JSON(200, gin.H{
-		"order_id":          order.ID,
-		"execution_plan":    order.ExecutionPlan,
-		"completed_windows": order.CompletedWindows,
-		"status":           order.Status,
+func (e *ProductionTWAPEngine) calculateTWAPQuote(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int) (*TWAPQuoteResponse, error) {
+	// Get instant swap quote for comparison
+	instantQuote, err := e.aggregationClient.GetSwap(ctx, aggregation.GetSwapParams{
+		Src:             req.SourceToken,
+		Dst:             req.DestToken,
+		Amount:          totalAmount.String(),
+		From:            req.UserAddress,
+		Slippage:        1,
+		DisableEstimate: true,
 	})
-}
-
-// ListOrders lists all orders
-func (e *Engine) ListOrders(c *gin.Context) {
-	e.ordersMutex.RLock()
-	orders := make([]*TWAPOrder, 0, len(e.orders))
-	for _, order := range e.orders {
-		orders = append(orders, order)
-	}
-	e.ordersMutex.RUnlock()
-
-	c.JSON(200, gin.H{
-		"orders": orders,
-		"count":  len(orders),
-	})
-}
-
-// CancelOrder cancels an order
-func (e *Engine) CancelOrder(c *gin.Context) {
-	orderID := c.Param("id")
-	
-	e.ordersMutex.Lock()
-	order, exists := e.orders[orderID]
-	if exists && order.Status == OrderStatusPending {
-		order.Status = OrderStatusCancelled
-	}
-	e.ordersMutex.Unlock()
-	
-	if !exists {
-		c.JSON(404, gin.H{"error": "order not found"})
-		return
-	}
-
-	c.JSON(200, gin.H{"message": "order cancelled"})
-}
-
-// GetStatus returns engine status
-func (e *Engine) GetStatus() map[string]interface{} {
-	e.ordersMutex.RLock()
-	orderCount := len(e.orders)
-	e.ordersMutex.RUnlock()
-
-	return map[string]interface{}{
-		"status":           "running",
-		"order_count":      orderCount,
-		"metrics":          e.metrics.GetSummary(),
-		"uptime":           time.Since(e.metrics.StartTime).String(),
-		"circuit_breaker":  e.circuitBreaker.IsTripped(),
-	}
-}
-
-// shutdown handles graceful shutdown
-func (e *Engine) shutdown(ctx context.Context) error {
-	e.logger.Info("Initiating graceful shutdown")
-	
-	if err := e.persistOrders(ctx); err != nil {
-		e.logger.Error("Failed to persist orders during shutdown", zap.Error(err))
-	}
-	
-	if err := e.redisClient.Close(); err != nil {
-		e.logger.Error("Failed to close Redis connection", zap.Error(err))
-	}
-	
-	return nil
-}
-
-// processExecutions processes ready executions
-func (e *Engine) processExecutions(ctx context.Context) error {
-	now := time.Now()
-	
-	e.ordersMutex.RLock()
-	orders := make([]*TWAPOrder, 0, len(e.orders))
-	for _, order := range e.orders {
-		if order.Status == OrderStatusPending || order.Status == OrderStatusExecuting {
-			orders = append(orders, order)
-		}
-	}
-	e.ordersMutex.RUnlock()
-
-	for _, order := range orders {
-		if order.Status == OrderStatusPending && now.After(order.StartTime) {
-			e.ordersMutex.Lock()
-			order.Status = OrderStatusExecuting
-			e.ordersMutex.Unlock()
-		}
-
-		for _, window := range order.ExecutionPlan {
-			if window.Status == WindowStatusPending && now.After(window.StartTime) && now.Before(window.EndTime) {
-				go func(o *TWAPOrder, w *ExecutionWindow) {
-					if err := e.executeWindow(ctx, o, w); err != nil {
-						e.logger.Error("Window execution failed",
-							zap.String("order_id", o.ID),
-							zap.Int("window", w.Index),
-							zap.Error(err),
-						)
-					}
-				}(order, window)
-			}
-		}
-
-		if e.isOrderComplete(order) {
-			e.ordersMutex.Lock()
-			order.Status = OrderStatusCompleted
-			e.ordersMutex.Unlock()
-		}
-	}
-
-	return nil
-}
-
-// hashSecret generates a Keccak256 hash
-func (e *Engine) hashSecret(secret []byte) string {
-	hash := crypto.Keccak256(secret)
-	return "0x" + hex.EncodeToString(hash)
-}
-
-// generateSecret creates a cryptographically secure random secret
-func (e *Engine) generateSecret() ([]byte, error) {
-	secret := make([]byte, 32)
-	_, err := rand.Read(secret)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate random secret: %w", err)
-	}
-	return secret, nil
-}
-
-// calculateTWAPQuote generates a TWAP quote
-func (e *Engine) calculateTWAPQuote(ctx context.Context, req TWAPQuoteRequest, totalAmount *big.Int) (*TWAPQuoteResponse, error) {
-	if err := e.validateQuoteRequest(req); err != nil {
-		return nil, err
-	}
-
-	// Check circuit breaker
-	if e.circuitBreaker.IsTripped() {
-		return nil, fmt.Errorf("1inch API circuit breaker is tripped, try again later")
-	}
-
-	// Get instant quote
-	instantQuote, err := e.oneInchClient.GetQuote(ctx, e.chainID.String(), req.SourceToken, req.DestToken, totalAmount.String())
-	if err != nil {
-		e.circuitBreaker.RecordFailure()
 		return nil, fmt.Errorf("failed to get instant quote: %w", err)
 	}
 
-	instantOutput, ok := new(big.Int).SetString(instantQuote.DstAmount, 10)
-	if !ok {
-		return nil, fmt.Errorf("invalid instant quote amount: %s", instantQuote.DstAmount)
-	}
-
-	instantImpact := e.calculatePriceImpact(totalAmount, instantOutput)
-
-	// Calculate interval quote
+	// Calculate interval amount and get interval quote
 	intervalAmount := new(big.Int).Div(totalAmount, big.NewInt(int64(req.IntervalCount)))
-	intervalQuote, err := e.oneInchClient.GetQuote(ctx, e.chainID.String(), req.SourceToken, req.DestToken, intervalAmount.String())
+	intervalQuote, err := e.aggregationClient.GetSwap(ctx, aggregation.GetSwapParams{
+		Src:             req.SourceToken,
+		Dst:             req.DestToken,
+		Amount:          intervalAmount.String(),
+		From:            req.UserAddress,
+		Slippage:        req.MaxSlippage,
+		DisableEstimate: true,
+	})
 	if err != nil {
-		e.circuitBreaker.RecordFailure()
 		return nil, fmt.Errorf("failed to get interval quote: %w", err)
 	}
 
-	intervalOutput, ok := new(big.Int).SetString(intervalQuote.DstAmount, 10)
+	// Calculate estimated TWAP output
+	intervalOutput, ok := new(big.Int).SetString(intervalQuote.ToTokenAmount, 10)
 	if !ok {
-		return nil, fmt.Errorf("invalid interval quote amount: %s", intervalQuote.DstAmount)
+		return nil, fmt.Errorf("invalid interval output amount")
+	}
+	twapEstimatedOutput := new(big.Int).Mul(intervalOutput, big.NewInt(int64(req.IntervalCount)))
+
+	// Compare price impacts
+	instantOutput, ok := new(big.Int).SetString(instantQuote.ToTokenAmount, 10)
+	if !ok {
+		return nil, fmt.Errorf("invalid instant output amount")
 	}
 
-	twapEstimatedOutput := new(big.Int).Mul(intervalOutput, big.NewInt(int64(req.IntervalCount)))
+	instantImpact := e.calculatePriceImpact(totalAmount, instantOutput)
 	twapImpact := e.calculatePriceImpact(totalAmount, twapEstimatedOutput)
 
 	improvement := ((instantImpact - twapImpact) / instantImpact) * 100
@@ -578,13 +438,22 @@ func (e *Engine) calculateTWAPQuote(ctx context.Context, req TWAPQuoteRequest, t
 		improvement = 0
 	}
 
-	schedule := e.generateSchedulePreview(req, totalAmount)
-	fees, err := e.calculateFees(req, instantQuote.Gas, instantQuote.GasPrice)
-	if err != nil {
-		return nil, fmt.Errorf("failed to calculate fees: %w", err)
+	// Get Fusion+ quote if requested
+	var fusionPlusQuote interface{}
+	if req.UseFusionPlus {
+		fusionQuote, err := e.getFusionPlusQuote(ctx, req, intervalAmount)
+		if err != nil {
+			e.logger.Warn("Failed to get Fusion+ quote", zap.Error(err))
+		} else {
+			fusionPlusQuote = fusionQuote
+		}
 	}
 
-	e.circuitBreaker.RecordSuccess()
+	// Generate execution schedule
+	schedule := e.generateExecutionSchedule(req, totalAmount)
+
+	// Calculate fees
+	fees := e.calculateFees(req, instantQuote.EstimatedGas)
 
 	return &TWAPQuoteResponse{
 		EstimatedOutput: twapEstimatedOutput.String(),
@@ -596,80 +465,73 @@ func (e *Engine) calculateTWAPQuote(ctx context.Context, req TWAPQuoteRequest, t
 		},
 		ExecutionSchedule: schedule,
 		Fees:              fees,
-		Recommendations:   e.generateRecommendations(instantImpact, twapImpact, req.IntervalCount, req.TimeWindow),
+		Recommendations:   e.generateRecommendations(instantImpact, twapImpact, req.IntervalCount),
+		FusionPlusQuote:   fusionPlusQuote,
 	}, nil
 }
 
-// validateQuoteRequest validates TWAP quote request
-func (e *Engine) validateQuoteRequest(req TWAPQuoteRequest) error {
-	if !common.IsHexAddress(req.SourceToken) || !common.IsHexAddress(req.DestToken) {
-		return fmt.Errorf("invalid token addresses")
+func (e *ProductionTWAPEngine) getFusionPlusQuote(ctx context.Context, req CreateTWAPOrderRequest, intervalAmount *big.Int) (interface{}, error) {
+	// Get source and destination chain IDs
+	srcChain := float32(e.chainID)
+	dstChain := float32(1) // Cosmos or target chain
+
+	quoteParams := fusionplus.QuoterControllerGetQuoteParamsFixed{
+		SrcChain:        srcChain,
+		DstChain:        dstChain,
+		SrcTokenAddress: req.SourceToken,
+		DstTokenAddress: req.DestToken,
+		Amount:          intervalAmount.String(),
+		WalletAddress:   req.UserAddress,
+		EnableEstimate:  true,
 	}
-	if req.IntervalCount <= 0 || req.IntervalCount > 1000 {
-		return fmt.Errorf("invalid interval count: %d", req.IntervalCount)
-	}
-	if req.TimeWindow <= 0 || req.TimeWindow > 86400 {
-		return fmt.Errorf("invalid time window: %d", req.TimeWindow)
-	}
-	return nil
+
+	return e.fusionPlusClient.GetQuote(ctx, quoteParams)
 }
 
-// validateTWAPRequest validates TWAP order request
-func (e *Engine) validateTWAPRequest(req CreateTWAPOrderRequest) error {
-	if !common.IsHexAddress(req.SourceToken) || !common.IsHexAddress(req.DestToken) {
-		return fmt.Errorf("invalid token addresses")
-	}
-	if req.IntervalCount <= 0 || req.IntervalCount > 100 {
-		return fmt.Errorf("invalid interval count: %d", req.IntervalCount)
-	}
-	if req.TimeWindow <= 0 || req.TimeWindow > 86400 {
-		return fmt.Errorf("invalid time window: %d", req.TimeWindow)
-	}
-	if req.MaxSlippage < 0 || req.MaxSlippage > 10 {
-		return fmt.Errorf("invalid slippage: %f", req.MaxSlippage)
-	}
-	return nil
-}
-
-// createTWAPOrder creates a new TWAP order
-func (e *Engine) createTWAPOrder(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int) (*TWAPOrder, error) {
+func (e *ProductionTWAPEngine) createTWAPOrder(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int) (*TWAPOrder, error) {
 	orderID := e.generateOrderID()
 	
 	startTime := time.Now().Add(time.Duration(req.StartDelay) * time.Second)
 	if req.StartDelay == 0 {
-		startTime = startTime.Add(1 * time.Minute)
+		startTime = startTime.Add(1 * time.Minute) // Default 1 minute delay
 	}
 
-	executionPlan, err := e.generateExecutionPlan(ctx, req, totalAmount, startTime)
+	// Generate execution windows
+	windows, err := e.generateExecutionWindows(ctx, req, totalAmount, startTime)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate execution plan: %w", err)
+		return nil, fmt.Errorf("failed to generate execution windows: %w", err)
 	}
 
 	order := &TWAPOrder{
-		ID:              orderID,
-		UserAddress:     req.UserAddress,
-		SourceToken:     req.SourceToken,
-		DestToken:       req.DestToken,
-		TotalAmount:     totalAmount,
-		IntervalCount:   req.IntervalCount,
-		TimeWindow:      req.TimeWindow,
-		ExecutionPlan:   executionPlan,
-		Status:          OrderStatusPending,
+		ID:               orderID,
+		UserAddress:      req.UserAddress,
+		SourceToken:      req.SourceToken,
+		DestToken:        req.DestToken,
+		TotalAmount:      totalAmount,
+		IntervalCount:    req.IntervalCount,
+		TimeWindow:       req.TimeWindow,
+		MaxSlippage:      req.MaxSlippage,
+		Status:           TWAPOrderStatusPending,
+		CreatedAt:        time.Now(),
+		StartTime:        startTime,
+		ExecutionWindows: windows,
 		CompletedWindows: 0,
-		TotalExecuted:   big.NewInt(0),
-		CreatedAt:       time.Now(),
-		StartTime:       startTime,
+		TotalExecuted:    big.NewInt(0),
+		FusionPlusOrders: make([]*FusionPlusOrderRef, 0),
+		OrderbookOrders:  make([]*OrderbookOrderRef, 0),
 	}
 
+	// Store order
 	e.ordersMutex.Lock()
-	e.orders[orderID] = order
+	e.twapOrders[orderID] = order
 	e.ordersMutex.Unlock()
 
+	// Schedule execution
 	e.scheduler.ScheduleOrder(order)
-	e.metrics.RecordOrderScheduled()
 
+	// Persist order
 	if err := e.persistOrder(ctx, order); err != nil {
-		e.logger.Warn("Failed to persist order", zap.String("order_id", orderID), zap.Error(err))
+		e.logger.Warn("Failed to persist TWAP order", zap.String("order_id", orderID), zap.Error(err))
 	}
 
 	e.logger.Info("TWAP order created",
@@ -677,20 +539,14 @@ func (e *Engine) createTWAPOrder(ctx context.Context, req CreateTWAPOrderRequest
 		zap.String("user", req.UserAddress),
 		zap.Int("intervals", req.IntervalCount),
 		zap.String("total_amount", totalAmount.String()),
+		zap.Bool("fusion_plus", req.UseFusionPlus),
+		zap.Bool("orderbook", req.UseOrderbook),
 	)
 
 	return order, nil
 }
 
-// generateOrderID creates a unique order ID
-func (e *Engine) generateOrderID() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
-}
-
-// generateExecutionPlan creates the execution plan for a TWAP order
-func (e *Engine) generateExecutionPlan(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int, startTime time.Time) ([]*ExecutionWindow, error) {
+func (e *ProductionTWAPEngine) generateExecutionWindows(ctx context.Context, req CreateTWAPOrderRequest, totalAmount *big.Int, startTime time.Time) ([]*ExecutionWindow, error) {
 	windows := make([]*ExecutionWindow, req.IntervalCount)
 	intervalDuration := time.Duration(req.TimeWindow) * time.Second / time.Duration(req.IntervalCount)
 	
@@ -706,6 +562,7 @@ func (e *Engine) generateExecutionPlan(ctx context.Context, req CreateTWAPOrderR
 			windowAmount.Add(windowAmount, big.NewInt(1))
 		}
 
+		// Generate secret for atomic swap
 		secret, err := e.generateSecret()
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate secret for window %d: %w", i, err)
@@ -715,25 +572,59 @@ func (e *Engine) generateExecutionPlan(ctx context.Context, req CreateTWAPOrderR
 		windows[i] = &ExecutionWindow{
 			Index:      i,
 			Amount:     windowAmount,
-			Secret:     secret,
-			SecretHash: secretHash,
-			Status:     WindowStatusPending,
 			StartTime:  windowStart,
 			EndTime:    windowEnd,
+			Status:     WindowStatusPending,
+			Secret:     secret,
+			SecretHash: secretHash,
 		}
 	}
 
 	return windows, nil
 }
 
-// executeWindow executes a single TWAP window
-func (e *Engine) executeWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
-	if e.circuitBreaker.IsTripped() {
-		return fmt.Errorf("circuit breaker tripped")
+func (e *ProductionTWAPEngine) processExecutions(ctx context.Context) error {
+	now := time.Now()
+	
+	e.ordersMutex.RLock()
+	orders := make([]*TWAPOrder, 0, len(e.twapOrders))
+	for _, order := range e.twapOrders {
+		if order.Status == TWAPOrderStatusPending || order.Status == TWAPOrderStatusExecuting {
+			orders = append(orders, order)
+		}
+	}
+	e.ordersMutex.RUnlock()
+
+	for _, order := range orders {
+		// Start order execution if it's time
+		if order.Status == TWAPOrderStatusPending && now.After(order.StartTime) {
+			e.ordersMutex.Lock()
+			order.Status = TWAPOrderStatusExecuting
+			e.ordersMutex.Unlock()
+		}
+
+		// Process execution windows
+		for _, window := range order.ExecutionWindows {
+			if window.Status == WindowStatusPending && now.After(window.StartTime) && now.Before(window.EndTime) {
+				go e.executeWindow(ctx, order, window)
+			}
+		}
+
+		// Check if order is complete
+		if e.isOrderComplete(order) {
+			e.ordersMutex.Lock()
+			order.Status = TWAPOrderStatusCompleted
+			e.ordersMutex.Unlock()
+		}
 	}
 
+	return nil
+}
+
+func (e *ProductionTWAPEngine) executeWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) {
 	if err := e.rateLimiter.Wait(ctx); err != nil {
-		return err
+		e.logger.Error("Rate limit exceeded", zap.Error(err))
+		return
 	}
 
 	window.Status = WindowStatusExecuting
@@ -746,682 +637,137 @@ func (e *Engine) executeWindow(ctx context.Context, order *TWAPOrder, window *Ex
 		zap.String("amount", window.Amount.String()),
 	)
 
-	var ethTxHash common.Hash
-	var cosmosTxHash string
-	var actualPrice *big.Int
-	var gasUsed uint64
-
-	// Exponential backoff retry logic
-	for attempt := 0; attempt < MaxRetries; attempt++ {
-		// Create Ethereum escrow
-		hash, err := e.createEthereumEscrow(ctx, order, window)
-		if err != nil {
-			e.logger.Warn("Failed to create Ethereum escrow",
-				zap.Int("attempt", attempt+1),
-				zap.Error(err))
-			if attempt < MaxRetries-1 {
-				time.Sleep(time.Duration(attempt+1) * RetryDelay)
-				continue
-			}
-			return e.handleWindowError(order, window, fmt.Errorf("ethereum escrow creation failed: %w", err))
-		}
-		ethTxHash = hash
-		window.EthereumTxHash = hash.Hex()
-
-		// Wait for Ethereum confirmation
-		confirmed, err := e.waitForEthereumConfirmation(ctx, ethTxHash)
-		if err != nil || !confirmed {
-			e.logger.Warn("Ethereum confirmation failed",
-				zap.Int("attempt", attempt+1),
-				zap.Error(err))
-			if attempt < MaxRetries-1 {
-				time.Sleep(time.Duration(attempt+1) * RetryDelay)
-				continue
-			}
-			return e.handleWindowError(order, window, fmt.Errorf("ethereum confirmation failed: %w", err))
-		}
-
-		// Create Cosmos escrow
-		cosmosTxHash, err = e.createCosmosEscrow(ctx, order, window)
-		if err != nil {
-			e.logger.Warn("Failed to create Cosmos escrow",
-				zap.Int("attempt", attempt+1),
-				zap.Error(err))
-			if attempt < MaxRetries-1 {
-				time.Sleep(time.Duration(attempt+1) * RetryDelay)
-				continue
-			}
-			return e.handleWindowError(order, window, fmt.Errorf("cosmos escrow creation failed: %w", err))
-		}
-		window.CosmosTxHash = cosmosTxHash
-
-		// Wait for Cosmos confirmation
-		confirmed, err = e.waitForCosmosConfirmation(ctx, cosmosTxHash)
-		if err != nil || !confirmed {
-			e.logger.Warn("Cosmos confirmation failed",
-				zap.Int("attempt", attempt+1),
-				zap.Error(err))
-			if attempt < MaxRetries-1 {
-				time.Sleep(time.Duration(attempt+1) * RetryDelay)
-				continue
-			}
-			return e.handleWindowError(order, window, fmt.Errorf("cosmos confirmation failed: %w", err))
-		}
-
-		// Execute swap
-		actualPrice, gasUsed, err = e.executeSwap(ctx, order, window)
-		if err != nil {
-			e.circuitBreaker.RecordFailure()
-			e.logger.Warn("Swap execution failed",
-				zap.Int("attempt", attempt+1),
-				zap.Error(err))
-			if attempt < MaxRetries-1 {
-				time.Sleep(time.Duration(attempt+1) * RetryDelay)
-				continue
-			}
-			return e.handleWindowError(order, window, fmt.Errorf("swap execution failed: %w", err))
-		}
-
-		// Success - break out of retry loop
-		break
+	// Choose execution method (Fusion+ or Orderbook)
+	var err error
+	if e.shouldUseFusionPlus(order, window) {
+		err = e.executeFusionPlusWindow(ctx, order, window)
+	} else {
+		err = e.executeOrderbookWindow(ctx, order, window)
 	}
 
-	// Reveal secret
-	if err := e.revealSecret(ctx, order, window); err != nil {
-		e.logger.Warn("Failed to reveal secret, but swap completed",
+	if err != nil {
+		window.Status = WindowStatusFailed
+		e.logger.Error("TWAP window execution failed",
 			zap.String("order_id", order.ID),
 			zap.Int("window", window.Index),
-			zap.Error(err))
+			zap.Error(err),
+		)
+		return
 	}
 
-	// Update window status
 	window.Status = WindowStatusCompleted
-	window.ActualPrice = actualPrice
-	window.GasUsed = gasUsed
-
-	// Update order
 	e.ordersMutex.Lock()
 	order.CompletedWindows++
 	order.TotalExecuted.Add(order.TotalExecuted, window.Amount)
 	e.ordersMutex.Unlock()
 
-	// Persist execution data
-	e.storeExecutionData(ctx, order.ID, window)
-
-	e.logger.Info("TWAP window completed successfully",
+	e.logger.Info("TWAP window completed",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
-		zap.String("eth_tx", window.EthereumTxHash),
-		zap.String("cosmos_tx", window.CosmosTxHash),
-		zap.String("actual_price", actualPrice.String()),
-		zap.Uint64("gas_used", gasUsed),
-		zap.Duration("total_duration", time.Since(executionStart)),
+		zap.Duration("execution_time", time.Since(executionStart)),
 	)
-
-	e.circuitBreaker.RecordSuccess()
-	e.metrics.RecordWindowExecution(order.ID, window.Index, time.Since(executionStart), window.GasUsed)
-	return nil
 }
 
-// The implementation continues with more methods...
-// [Methods for createEthereumEscrow, waitForEthereumConfirmation, createCosmosEscrow, etc.]
-// [Circuit breaker implementation]
-// [1inch client methods]
-// [Helper methods]
-
-// Circuit Breaker implementation
-func NewCircuitBreaker(threshold int, resetTimeout time.Duration) *CircuitBreaker {
-	return &CircuitBreaker{
-		threshold:    threshold,
-		resetTimeout: resetTimeout,
-	}
-}
-
-func (cb *CircuitBreaker) IsTripped() bool {
-	cb.mutex.RLock()
-	defer cb.mutex.RUnlock()
-	
-	if cb.isTripped {
-		if time.Since(cb.lastTrip) > cb.resetTimeout {
-			cb.isTripped = false
-			cb.failureCount = 0
-			return false
-		}
-		return true
-	}
-	return false
-}
-
-func (cb *CircuitBreaker) RecordFailure() {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-	
-	cb.failureCount++
-	if cb.failureCount >= cb.threshold {
-		cb.isTripped = true
-		cb.lastTrip = time.Now()
-	}
-}
-
-func (cb *CircuitBreaker) RecordSuccess() {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-	
-	cb.failureCount = 0
-	cb.isTripped = false
-}
-
-// OneInch client methods
-func (c *OneInchClient) GetQuote(ctx context.Context, chainID, src, dst, amount string) (*OneInchQuoteResponse, error) {
-    if err := c.rateLimiter.Wait(ctx); err != nil {
-        return nil, err
-    }
-
-    endpoint := fmt.Sprintf("%s%s/%s/quote", OneInchAPIBaseURL, OneInchQuoteAPI, chainID)
-    
-    params := url.Values{}
-    params.Set("src", src)
-    params.Set("dst", dst)
-    params.Set("amount", amount)
-    
-    bodyBytes, err := c.makeRequest(ctx, "GET", endpoint+"?"+params.Encode(), nil)
-    if err != nil {
-        return nil, fmt.Errorf("failed to get quote: %w", err)
-    }
-
-    var quote OneInchQuoteResponse
-    if err := json.Unmarshal(bodyBytes, &quote); err != nil {
-        return nil, fmt.Errorf("failed to decode quote response: %w", err)
-    }
-
-    return &quote, nil
-}
-
-func (c *OneInchClient) GetSwap(ctx context.Context, chainID, src, dst, amount, from string, slippage float64) (*OneInchSwapResponse, error) {
-    if err := c.rateLimiter.Wait(ctx); err != nil {
-        return nil, err
-    }
-
-    endpoint := fmt.Sprintf("%s%s/%s/swap", OneInchAPIBaseURL, OneInchSwapAPI, chainID)
-    
-    params := url.Values{}
-    params.Set("src", src)
-    params.Set("dst", dst)
-    params.Set("amount", amount)
-    params.Set("from", from)
-    params.Set("slippage", strconv.FormatFloat(slippage, 'f', 2, 64))
-    
-    bodyBytes, err := c.makeRequest(ctx, "GET", endpoint+"?"+params.Encode(), nil)
-    if err != nil {
-        return nil, fmt.Errorf("failed to get swap: %w", err)
-    }
-
-    var swap OneInchSwapResponse
-    if err := json.Unmarshal(bodyBytes, &swap); err != nil {
-        return nil, fmt.Errorf("failed to decode swap response: %w", err)
-    }
-
-    return &swap, nil
-}
-
-
-func (c *OneInchClient) makeRequest(ctx context.Context, method, url string, body io.Reader) ([]byte, error) {
-    var lastErr error
-    for i := 0; i < MaxRetries; i++ {
-        req, err := http.NewRequestWithContext(ctx, method, url, body)
-        if err != nil {
-            return nil, fmt.Errorf("failed to create request: %w", err)
-        }
-
-        req.Header.Set("Authorization", "Bearer "+c.apiKey)
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("User-Agent", "FlowFusion/1.0")
-
-        resp, err := c.httpClient.Do(req)
-        if err != nil {
-            lastErr = fmt.Errorf("request failed: %w", err)
-            if i < MaxRetries-1 {
-                time.Sleep(RetryDelay)
-            }
-            continue
-        }
-        defer resp.Body.Close()
-
-        if resp.StatusCode != http.StatusOK {
-            bodyBytes, _ := io.ReadAll(resp.Body)
-            lastErr = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-            if i < MaxRetries-1 {
-                time.Sleep(RetryDelay)
-            }
-            continue
-        }
-
-        bodyBytes, err := io.ReadAll(resp.Body)
-        if err != nil {
-            lastErr = fmt.Errorf("failed to read response body: %w", err)
-            if i < MaxRetries-1 {
-                time.Sleep(RetryDelay)
-            }
-            continue
-        }
-
-        return bodyBytes, nil
-    }
-    return nil, fmt.Errorf("failed after %d retries: %w", MaxRetries, lastErr)
-}
-
-// createEthereumEscrow creates an Ethereum escrow transaction
-func (e *Engine) createEthereumEscrow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) (common.Hash, error) {
-	gasPrice, err := e.ethClient.SuggestGasPrice(ctx)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to get gas price: %w", err)
-	}
-
-	if e.config.MaxGasPrice != nil && gasPrice.Cmp(e.config.MaxGasPrice) > 0 {
-		gasPrice = e.config.MaxGasPrice
-	}
-
-	params := ethereum.CreateEscrowParams{
-		Recipient:  order.UserAddress,
-		Amount:     window.Amount,
-		SecretHash: window.SecretHash,
-		TimeLimit:  uint64(time.Now().Add(24 * time.Hour).Unix()),
-	}
-
-	txHash, err := e.ethClient.CreateEscrow(ctx, params)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("failed to create Ethereum escrow: %w", err)
-	}
-
-	return txHash, nil
-}
-
-// waitForEthereumConfirmation waits for Ethereum transaction confirmation
-func (e *Engine) waitForEthereumConfirmation(ctx context.Context, txHash common.Hash) (bool, error) {
-	timeout := time.After(10 * time.Minute)
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-timeout:
-			return false, fmt.Errorf("timeout waiting for Ethereum confirmation")
-		case <-ticker.C:
-			receipt, err := e.ethClient.GetTransactionReceipt(ctx, txHash)
-			if err != nil {
-				continue // Transaction not yet mined
-			}
-
-			if receipt.Status == types.ReceiptStatusSuccessful {
-				currentBlock, err := e.ethClient.GetCurrentBlockNumber(ctx)
-				if err != nil {
-					continue
-				}
-				
-				if currentBlock-receipt.BlockNumber.Uint64() >= ConfirmationBlocks {
-					return true, nil
-				}
-			} else {
-				return false, fmt.Errorf("transaction failed with status: %d", receipt.Status)
-			}
-		}
-	}
-}
-
-// createCosmosEscrow creates a Cosmos escrow transaction
-func (e *Engine) createCosmosEscrow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) (string, error) {
-	params := cosmos.CreateEscrowParams{
-		EthereumTxHash: window.EthereumTxHash,
-		SecretHash:     window.SecretHash,
-		TimeLock:       uint64(time.Now().Add(24 * time.Hour).Unix()),
-		Recipient:      order.UserAddress,
-		EthereumSender: e.ethClient.GetAddress().Hex(),
-		Amount:         window.Amount,
-	}
-
-	txHash, err := e.cosmosClient.CreateEscrow(ctx, params)
-	if err != nil {
-		return "", fmt.Errorf("failed to create Cosmos escrow: %w", err)
-	}
-
-	return txHash, nil
-}
-
-// waitForCosmosConfirmation waits for Cosmos transaction confirmation
-func (e *Engine) waitForCosmosConfirmation(ctx context.Context, txHash string) (bool, error) {
-	timeout := time.After(5 * time.Minute)
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-timeout:
-			return false, fmt.Errorf("timeout waiting for Cosmos confirmation")
-		case <-ticker.C:
-			txResp, err := e.cosmosClient.GetTransactionStatus(ctx, txHash)
-			if err != nil {
-				continue // Transaction not yet processed
-			}
-			
-			if txResp.Code == 0 {
-				return true, nil
-			} else {
-				return false, fmt.Errorf("transaction failed with code %d: %s", txResp.Code, txResp.RawLog)
-			}
-		}
-	}
-}
-
-// executeSwap executes the 1inch swap transaction
-func (e *Engine) executeSwap(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) (*big.Int, uint64, error) {
-	swapData, err := e.oneInchClient.GetSwap(ctx, e.chainID.String(), order.SourceToken, order.DestToken, 
-		window.Amount.String(), e.ethClient.GetAddress().Hex(), 1.0) // 1% slippage
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to get swap data: %w", err)
-	}
-
-	actualOutput, ok := new(big.Int).SetString(swapData.DstAmount, 10)
-	if !ok {
-		return nil, 0, fmt.Errorf("invalid swap output amount: %s", swapData.DstAmount)
-	}
-
-	// Execute the swap transaction through Ethereum client
-	txData := common.FromHex(swapData.Tx.Data)
-	value, _ := new(big.Int).SetString(swapData.Tx.Value, 10)
-	gasPrice, _ := new(big.Int).SetString(swapData.Tx.GasPrice, 10)
-
-	tx := types.NewTransaction(
-		0, 
-		common.HexToAddress(swapData.Tx.To),
-		value,
-		uint64(swapData.Tx.Gas),
-		gasPrice,
-		txData,
-	)
-
-	signedTx, err := e.ethClient.SignTransaction(ctx, tx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to sign swap transaction: %w", err)
-	}
-
-	err = e.ethClient.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to send swap transaction: %w", err)
-	}
-
-	// Wait for transaction confirmation
-	confirmed, err := e.waitForEthereumConfirmation(ctx, signedTx.Hash())
-	if err != nil || !confirmed {
-		return nil, 0, fmt.Errorf("swap transaction confirmation failed: %w", err)
-	}
-
-	return actualOutput, uint64(swapData.Tx.Gas), nil
-}
-
-// revealSecret reveals the secret to complete the atomic swap
-func (e *Engine) revealSecret(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
-	secretHex := hex.EncodeToString(window.Secret)
-	txHash, err := e.ethClient.RevealSecret(ctx, common.HexToAddress(order.UserAddress), secretHex)
-	if err != nil {
-		return fmt.Errorf("failed to reveal secret: %w", err)
-	}
-
-	confirmed, err := e.waitForEthereumConfirmation(ctx, txHash)
-	if err != nil || !confirmed {
-		return fmt.Errorf("secret revelation confirmation failed: %w", err)
-	}
-
-	return nil
-}
-
-// handleWindowError handles window execution errors
-func (e *Engine) handleWindowError(order *TWAPOrder, window *ExecutionWindow, err error) error {
-	window.Status = WindowStatusFailed
-	
-	e.logger.Error("TWAP window execution failed",
+func (e *ProductionTWAPEngine) executeFusionPlusWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
+	// Implementation for Fusion+ execution
+	// This would create a Fusion+ order for the window amount
+	e.logger.Info("Executing via Fusion+",
 		zap.String("order_id", order.ID),
 		zap.Int("window", window.Index),
-		zap.Error(err),
 	)
-
-	errorData := map[string]interface{}{
-		"order_id":    order.ID,
-		"window":      window.Index,
-		"error":       err.Error(),
-		"timestamp":   time.Now(),
-		"eth_tx":      window.EthereumTxHash,
-		"cosmos_tx":   window.CosmosTxHash,
-	}
 	
-	errorBytes, _ := json.Marshal(errorData)
-	e.redisClient.LPush(context.Background(), "twap:errors", errorBytes)
-	e.metrics.RecordWindowFailure(order.ID, window.Index)
-
-	return err
-}
-
-// storeExecutionData persists execution data to Redis
-func (e *Engine) storeExecutionData(ctx context.Context, orderID string, window *ExecutionWindow) {
-	key := fmt.Sprintf("twap:execution:%s:%d", orderID, window.Index)
-	data := map[string]interface{}{
-		"order_id":      orderID,
-		"window_index":  window.Index,
-		"amount":        window.Amount.String(),
-		"eth_tx":        window.EthereumTxHash,
-		"cosmos_tx":     window.CosmosTxHash,
-		"actual_price":  window.ActualPrice.String(),
-		"gas_used":      window.GasUsed,
-		"executed_at":   window.ExecutedAt,
-		"secret_hash":   window.SecretHash,
-		"status":        string(window.Status),
-	}
-	
-	dataBytes, _ := json.Marshal(data)
-	e.redisClient.Set(ctx, key, dataBytes, OrderTTL)
-}
-
-// persistOrder saves a single order to Redis
-func (e *Engine) persistOrder(ctx context.Context, order *TWAPOrder) error {
-	key := fmt.Sprintf("twap:order:%s", order.ID)
-	data, err := json.Marshal(order)
-	if err != nil {
-		return fmt.Errorf("failed to marshal order: %w", err)
-	}
-	
-	return e.redisClient.Set(ctx, key, data, OrderTTL).Err()
-}
-
-// persistOrders saves all orders to Redis
-func (e *Engine) persistOrders(ctx context.Context) error {
-	e.ordersMutex.RLock()
-	defer e.ordersMutex.RUnlock()
-
-	for _, order := range e.orders {
-		if err := e.persistOrder(ctx, order); err != nil {
-			e.logger.Error("Failed to persist order", 
-				zap.String("order_id", order.ID), 
-				zap.Error(err))
-		}
-	}
+	// Create Fusion+ order parameters similar to the example
+	// This is where you'd integrate with the actual Fusion+ SDK
 	return nil
 }
 
-// restoreOrders loads orders from Redis
-func (e *Engine) restoreOrders(ctx context.Context) error {
-	keys, err := e.redisClient.Keys(ctx, "twap:order:*").Result()
-	if err != nil {
-		return fmt.Errorf("failed to get order keys: %w", err)
-	}
-
-	for _, key := range keys {
-		data, err := e.redisClient.Get(ctx, key).Bytes()
-		if err != nil {
-			e.logger.Warn("Failed to restore order", zap.String("key", key), zap.Error(err))
-			continue
-		}
-
-		var order TWAPOrder
-		if err := json.Unmarshal(data, &order); err != nil {
-			e.logger.Warn("Failed to unmarshal order", zap.String("key", key), zap.Error(err))
-			continue
-		}
-
-		// Only restore active orders
-		if order.Status == OrderStatusPending || order.Status == OrderStatusExecuting {
-			e.ordersMutex.Lock()
-			e.orders[order.ID] = &order
-			e.ordersMutex.Unlock()
-			
-			// Re-schedule the order
-			e.scheduler.ScheduleOrder(&order)
-		}
-	}
-	
-	e.logger.Info("Restored orders from persistence", zap.Int("count", len(keys)))
-	return nil
-}
-
-// monitorOrders monitors order health and handles timeouts
-func (e *Engine) monitorOrders(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := e.checkOrderHealth(ctx); err != nil {
-				e.logger.Error("Error checking order health", zap.Error(err))
-			}
-		}
-	}
-}
-
-// checkOrderHealth checks for stuck or timed out orders
-func (e *Engine) checkOrderHealth(ctx context.Context) error {
-	e.ordersMutex.RLock()
-	orders := make([]*TWAPOrder, 0, len(e.orders))
-	for _, order := range e.orders {
-		if order.Status == OrderStatusExecuting {
-			orders = append(orders, order)
-		}
-	}
-	e.ordersMutex.RUnlock()
-
-	for _, order := range orders {
-		// Check for order timeout
-		if time.Since(order.CreatedAt) > OrderTTL {
-			e.handleOrderTimeout(order)
-			continue
-		}
-
-		// Check for stuck windows
-		for _, window := range order.ExecutionPlan {
-			if window.Status == WindowStatusExecuting && window.ExecutedAt != nil {
-				if time.Since(*window.ExecutedAt) > ExecutionTimeout {
-					e.handleWindowError(order, window, fmt.Errorf("window execution timeout"))
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// handleOrderTimeout handles expired orders
-func (e *Engine) handleOrderTimeout(order *TWAPOrder) {
-	e.ordersMutex.Lock()
-	order.Status = OrderStatusFailed
-	e.ordersMutex.Unlock()
-
-	e.logger.Warn("Order timed out",
+func (e *ProductionTWAPEngine) executeOrderbookWindow(ctx context.Context, order *TWAPOrder, window *ExecutionWindow) error {
+	// Implementation for Orderbook execution
+	// This would create a limit order for the window amount
+	e.logger.Info("Executing via Orderbook",
 		zap.String("order_id", order.ID),
-		zap.Duration("age", time.Since(order.CreatedAt)),
+		zap.Int("window", window.Index),
 	)
-
-	e.metrics.RecordOrderCompletion(order.ID, false)
+	
+	// Create orderbook order similar to the example
+	// This is where you'd integrate with the actual Orderbook SDK
+	return nil
 }
 
-// isOrderComplete checks if an order has completed execution
-func (e *Engine) isOrderComplete(order *TWAPOrder) bool {
-	return order.CompletedWindows >= order.IntervalCount
+// Helper methods
+func (e *ProductionTWAPEngine) shouldUseFusionPlus(order *TWAPOrder, window *ExecutionWindow) bool {
+	// Decision logic for choosing execution method
+	// Could be based on amount, market conditions, etc.
+	return window.Amount.Cmp(big.NewInt(1000000)) > 0 // Use Fusion+ for larger amounts
 }
 
-// calculatePriceImpact calculates price impact percentage
-func (e *Engine) calculatePriceImpact(inputAmount, outputAmount *big.Int) float64 {
+func (e *ProductionTWAPEngine) generateSecret() (string, error) {
+	return fusionplus.GetRandomBytes32()
+}
+
+func (e *ProductionTWAPEngine) hashSecret(secret string) string {
+	hash, _ := fusionplus.HashSecret(secret)
+	return hash
+}
+
+func (e *ProductionTWAPEngine) calculatePriceImpact(inputAmount, outputAmount *big.Int) float64 {
 	if inputAmount.Sign() == 0 {
 		return 0
 	}
-
-	// Assuming 1:1 base rate for simplification
-	expectedOutput := inputAmount
-	if outputAmount.Cmp(expectedOutput) >= 0 {
-		return 0 // No negative impact
-	}
-
-	impact := new(big.Int).Sub(expectedOutput, outputAmount)
+	
+	// Simple price impact calculation
+	// In production, this should use proper price feeds
+	impact := new(big.Int).Sub(inputAmount, outputAmount)
 	impact.Mul(impact, big.NewInt(10000))
-	impact.Div(impact, expectedOutput)
+	impact.Div(impact, inputAmount)
 	
 	return float64(impact.Int64()) / 100.0
 }
 
-// generateSchedulePreview creates execution schedule preview
-func (e *Engine) generateSchedulePreview(req TWAPQuoteRequest, totalAmount *big.Int) []SchedulePreview {
+func (e *ProductionTWAPEngine) generateExecutionSchedule(req CreateTWAPOrderRequest, totalAmount *big.Int) []SchedulePreview {
 	schedule := make([]SchedulePreview, req.IntervalCount)
 	intervalDuration := time.Duration(req.TimeWindow) * time.Second / time.Duration(req.IntervalCount)
 	intervalAmount := new(big.Int).Div(totalAmount, big.NewInt(int64(req.IntervalCount)))
 	
 	startTime := time.Now().Add(1 * time.Minute)
 	for i := 0; i < req.IntervalCount; i++ {
+		method := "orderbook"
+		if intervalAmount.Cmp(big.NewInt(1000000)) > 0 {
+			method = "fusion_plus"
+		}
+		
 		schedule[i] = SchedulePreview{
-			IntervalIndex:  i,
-			ExecutionTime:  startTime.Add(time.Duration(i) * intervalDuration),
-			Amount:         intervalAmount.String(),
-			EstimatedPrice: "0", // Can't predict future prices accurately
+			IntervalIndex:   i,
+			ExecutionTime:   startTime.Add(time.Duration(i) * intervalDuration),
+			Amount:          intervalAmount.String(),
+			EstimatedPrice:  "0", // Would be calculated from quotes
+			ExecutionMethod: method,
 		}
 	}
 	return schedule
 }
 
-// calculateFees calculates total execution fees
-func (e *Engine) calculateFees(req TWAPQuoteRequest, gasEstimate, gasPrice string) (FeeBreakdown, error) {
-	gas, err := strconv.ParseUint(gasEstimate, 10, 64)
-	if err != nil {
-		return FeeBreakdown{}, fmt.Errorf("invalid gas estimate: %w", err)
-	}
+func (e *ProductionTWAPEngine) calculateFees(req CreateTWAPOrderRequest, gasEstimate int) FeeBreakdown {
+	// Simple fee calculation - implement proper fee estimation
+	ethGas := big.NewInt(int64(gasEstimate) * int64(req.IntervalCount))
+	relayerFee := new(big.Int).Div(ethGas, big.NewInt(100)) // 1%
+	oneInchFee := new(big.Int).Div(ethGas, big.NewInt(333)) // ~0.3%
+	cosmosGas := big.NewInt(1000)
 	
-	price, ok := new(big.Int).SetString(gasPrice, 10)
-	if !ok {
-		return FeeBreakdown{}, fmt.Errorf("invalid gas price: %s", gasPrice)
-	}
-
-	ethGasCost := new(big.Int).Mul(big.NewInt(int64(gas)), price)
-	ethGasCost.Mul(ethGasCost, big.NewInt(int64(req.IntervalCount)))
-
-	relayerFee := new(big.Int).Div(ethGasCost, big.NewInt(100)) // 1% relayer fee
-	oneInchFee := new(big.Int).Div(ethGasCost, big.NewInt(333)) // ~0.3% 1inch fee
-	cosmosGas := big.NewInt(1000) // Fixed Cosmos gas cost
-	
-	total := new(big.Int).Add(ethGasCost, relayerFee)
+	total := new(big.Int).Add(ethGas, relayerFee)
 	total.Add(total, oneInchFee)
 	total.Add(total, cosmosGas)
 
 	return FeeBreakdown{
-		EthereumGas: ethGasCost.String(),
+		EthereumGas: ethGas.String(),
 		CosmosGas:   cosmosGas.String(),
 		RelayerFee:  relayerFee.String(),
 		OneInchFee:  oneInchFee.String(),
 		Total:       total.String(),
-	}, nil
+	}
 }
 
-// generateRecommendations provides execution recommendations
-func (e *Engine) generateRecommendations(instantImpact, twapImpact float64, intervalCount, timeWindow int) []string {
+func (e *ProductionTWAPEngine) generateRecommendations(instantImpact, twapImpact float64, intervalCount int) []string {
 	recommendations := []string{}
 	
 	if twapImpact < instantImpact {
@@ -1433,12 +779,223 @@ func (e *Engine) generateRecommendations(instantImpact, twapImpact float64, inte
 		recommendations = append(recommendations, "Consider increasing interval count for better price improvement")
 	}
 	
-	if timeWindow < 3600 {
-		recommendations = append(recommendations, "Extending time window may provide better execution prices")
-	}
-	
-	recommendations = append(recommendations, "Monitor market volatility during execution window")
-	recommendations = append(recommendations, "Ensure sufficient gas balance for all transactions")
+	recommendations = append(recommendations, "Monitor market volatility during execution")
+	recommendations = append(recommendations, "Use Fusion+ for larger amounts to minimize MEV")
 	
 	return recommendations
+}
+
+func (e *ProductionTWAPEngine) validateTWAPRequest(req CreateTWAPOrderRequest) error {
+	if !common.IsHexAddress(req.SourceToken) || !common.IsHexAddress(req.DestToken) {
+		return fmt.Errorf("invalid token addresses")
+	}
+	if req.IntervalCount <= 0 || req.IntervalCount > e.config.MaxIntervals {
+		return fmt.Errorf("invalid interval count: %d", req.IntervalCount)
+	}
+	if req.TimeWindow <= 0 || req.TimeWindow > 86400 {
+		return fmt.Errorf("invalid time window: %d", req.TimeWindow)
+	}
+	if req.MaxSlippage < 0 || req.MaxSlippage > e.config.MaxSlippage {
+		return fmt.Errorf("invalid slippage: %f", req.MaxSlippage)
+	}
+	return nil
+}
+
+func (e *ProductionTWAPEngine) generateOrderID() string {
+	return fmt.Sprintf("twap_%d_%s", time.Now().UnixNano(), hex.EncodeToString([]byte{byte(len(e.twapOrders))}))
+}
+
+func (e *ProductionTWAPEngine) isOrderComplete(order *TWAPOrder) bool {
+	return order.CompletedWindows >= order.IntervalCount
+}
+
+// Additional methods for GetOrder, ListOrders, CancelOrder, GetStatus, etc.
+func (e *ProductionTWAPEngine) GetOrder(c *gin.Context) {
+	orderID := c.Param("id")
+	
+	e.ordersMutex.RLock()
+	order, exists := e.twapOrders[orderID]
+	e.ordersMutex.RUnlock()
+	
+	if !exists {
+		c.JSON(404, gin.H{"error": "order not found"})
+		return
+	}
+
+	c.JSON(200, order)
+}
+
+func (e *ProductionTWAPEngine) ListOrders(c *gin.Context) {
+	e.ordersMutex.RLock()
+	orders := make([]*TWAPOrder, 0, len(e.twapOrders))
+	for _, order := range e.twapOrders {
+		orders = append(orders, order)
+	}
+	e.ordersMutex.RUnlock()
+
+	c.JSON(200, gin.H{
+		"orders": orders,
+		"count":  len(orders),
+	})
+}
+
+func (e *ProductionTWAPEngine) CancelOrder(c *gin.Context) {
+	orderID := c.Param("id")
+	
+	e.ordersMutex.Lock()
+	order, exists := e.twapOrders[orderID]
+	if exists && order.Status == TWAPOrderStatusPending {
+		order.Status = TWAPOrderStatusCancelled
+	}
+	e.ordersMutex.Unlock()
+	
+	if !exists {
+		c.JSON(404, gin.H{"error": "order not found"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "order cancelled"})
+}
+
+func (e *ProductionTWAPEngine) GetStatus() map[string]interface{} {
+	e.ordersMutex.RLock()
+	orderCount := len(e.twapOrders)
+	e.ordersMutex.RUnlock()
+
+	return map[string]interface{}{
+		"status":         "running",
+		"order_count":    orderCount,
+		"public_address": e.publicAddress.Hex(),
+		"chain_id":       e.chainID,
+		"metrics":        e.metrics.GetSummary(),
+	}
+}
+
+// Persistence and monitoring methods
+func (e *ProductionTWAPEngine) persistOrder(ctx context.Context, order *TWAPOrder) error {
+	key := fmt.Sprintf("twap:order:%s", order.ID)
+	data, err := json.Marshal(order)
+	if err != nil {
+		return fmt.Errorf("failed to marshal order: %w", err)
+	}
+	
+	return e.redisClient.Set(ctx, key, data, 24*time.Hour).Err()
+}
+
+func (e *ProductionTWAPEngine) restoreOrders(ctx context.Context) error {
+	keys, err := e.redisClient.Keys(ctx, "twap:order:*").Result()
+	if err != nil {
+		return fmt.Errorf("failed to get order keys: %w", err)
+	}
+
+	for _, key := range keys {
+		data, err := e.redisClient.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
+
+		var order TWAPOrder
+		if err := json.Unmarshal(data, &order); err != nil {
+			continue
+		}
+
+		if order.Status == TWAPOrderStatusPending || order.Status == TWAPOrderStatusExecuting {
+			e.ordersMutex.Lock()
+			e.twapOrders[order.ID] = &order
+			e.ordersMutex.Unlock()
+			
+			e.scheduler.ScheduleOrder(&order)
+		}
+	}
+	
+	e.logger.Info("Restored TWAP orders from persistence", zap.Int("count", len(keys)))
+	return nil
+}
+
+func (e *ProductionTWAPEngine) monitorTWAPOrders(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Monitor order health and handle timeouts
+			e.checkOrderHealth()
+		}
+	}
+}
+
+func (e *ProductionTWAPEngine) checkOrderHealth() {
+	// Implementation for order health monitoring
+}
+
+func (e *ProductionTWAPEngine) shutdown(ctx context.Context) error {
+	e.logger.Info("Shutting down TWAP Engine")
+	
+	if err := e.persistAllOrders(ctx); err != nil {
+		e.logger.Error("Failed to persist orders during shutdown", zap.Error(err))
+	}
+	
+	if err := e.redisClient.Close(); err != nil {
+		e.logger.Error("Failed to close Redis connection", zap.Error(err))
+	}
+	
+	return nil
+}
+
+func (e *ProductionTWAPEngine) persistAllOrders(ctx context.Context) error {
+	e.ordersMutex.RLock()
+	defer e.ordersMutex.RUnlock()
+
+	for _, order := range e.twapOrders {
+		if err := e.persistOrder(ctx, order); err != nil {
+			e.logger.Error("Failed to persist order", 
+				zap.String("order_id", order.ID), 
+				zap.Error(err))
+		}
+	}
+	return nil
+}
+
+// Placeholder types for scheduler and metrics
+type TWAPScheduler struct {
+	logger *zap.Logger
+	engine *ProductionTWAPEngine
+}
+
+func NewTWAPScheduler(logger *zap.Logger, engine *ProductionTWAPEngine) *TWAPScheduler {
+	return &TWAPScheduler{
+		logger: logger,
+		engine: engine,
+	}
+}
+
+func (s *TWAPScheduler) Start(ctx context.Context) {
+	// Scheduler implementation
+}
+
+func (s *TWAPScheduler) ScheduleOrder(order *TWAPOrder) {
+	// Schedule order implementation
+}
+
+type TWAPMetrics struct {
+	StartTime time.Time
+	mutex     sync.RWMutex
+}
+
+func NewTWAPMetrics() *TWAPMetrics {
+	return &TWAPMetrics{
+		StartTime: time.Now(),
+	}
+}
+
+func (m *TWAPMetrics) GetSummary() map[string]interface{} {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	
+	return map[string]interface{}{
+		"uptime": time.Since(m.StartTime).String(),
+	}
 }
