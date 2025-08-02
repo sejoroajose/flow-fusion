@@ -2,6 +2,7 @@ package twap
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"sync"
