@@ -7,13 +7,14 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"go.uber.org/zap"
+
+	"flow-fusion/relayer/internal/ethereum/generated"
 )
 
 const (
@@ -31,8 +32,8 @@ type Client struct {
 	chainID          *big.Int
 	logger           *zap.Logger
 	contractAddress  common.Address
-	contract         *FlowFusionEscrowFactory
-	escrowFactory    *IEscrowFactory
+	contract         *generated.FlowFusionEscrowFactory
+	escrowFactory    *generated.IEscrowFactory
 	auth             *bind.TransactOpts
 }
 
@@ -60,13 +61,13 @@ type ExecuteIntervalParams struct {
 	OrderID       [32]byte
 	IntervalIndex *big.Int
 	SecretHash    [32]byte
-	Immutables    IBaseEscrowImmutables
+	Immutables    generated.IBaseEscrowImmutables
 }
 
 type TWAPOrderInfo struct {
 	Maker             common.Address
 	Token             common.Address
-	Config            FlowFusionEscrowFactoryTWAPConfig
+	Config            generated.FlowFusionEscrowFactoryTWAPConfig
 	CosmosRecipient   string
 	ExecutedIntervals *big.Int
 	TotalExecuted     *big.Int
@@ -79,6 +80,22 @@ type CreateEscrowParams struct {
 	SecretHash string
 	TimeLimit  uint64
 	Token      string
+}
+
+// Define the missing IBaseEscrowImmutables struct based on the ABI
+type IBaseEscrowImmutables struct {
+	OrderHash     [32]byte
+	Hashlock      [32]byte
+	Maker         common.Address
+	Taker         common.Address
+	Token         common.Address
+	Amount        *big.Int
+	SafetyDeposit *big.Int
+	Timelocks     struct {
+		Prepayment *big.Int
+		Maturity   *big.Int
+		Expiration *big.Int
+	}
 }
 
 func NewClient(config Config, logger *zap.Logger) (*Client, error) {
@@ -108,7 +125,7 @@ func NewClient(config Config, logger *zap.Logger) (*Client, error) {
 	}
 
 	// Initialize FlowFusionEscrowFactory contract binding
-	contract, err := NewFlowFusionEscrowFactory(contractAddress, ethClient)
+	contract, err := generated.NewFlowFusionEscrowFactory(contractAddress, ethClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to bind FlowFusionEscrowFactory contract: %w", err)
 	}
@@ -121,7 +138,7 @@ func NewClient(config Config, logger *zap.Logger) (*Client, error) {
 	}
 
 	// Initialize IEscrowFactory contract binding
-	escrowFactory, err := NewIEscrowFactory(escrowFactoryAddress, ethClient)
+	escrowFactory, err := generated.NewIEscrowFactory(escrowFactoryAddress, ethClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to bind IEscrowFactory contract: %w", err)
 	}
@@ -205,7 +222,7 @@ func (c *Client) CreateTWAPOrder(ctx context.Context, params TWAPOrderParams) (*
 		return nil, fmt.Errorf("failed to update transaction options: %w", err)
 	}
 
-	config := FlowFusionEscrowFactoryTWAPConfig{
+	config := generated.FlowFusionEscrowFactoryTWAPConfig{
 		TotalAmount:   params.TotalAmount,
 		TimeWindow:    params.TimeWindow,
 		IntervalCount: params.IntervalCount,
@@ -432,7 +449,7 @@ func (c *Client) waitForReceipt(ctx context.Context, txHash common.Hash) (*types
 	}
 }
 
-func (c *Client) WatchTWAPOrderEvents(ctx context.Context, eventChan chan<- FlowFusionEscrowFactoryTWAPOrderCreated) error {
+func (c *Client) WatchTWAPOrderEvents(ctx context.Context, eventChan chan<- generated.FlowFusionEscrowFactoryTWAPOrderCreated) error {
 	c.logger.Info("Starting to watch TWAP order events")
 
 	currentBlock, err := c.ethClient.BlockNumber(ctx)
@@ -478,8 +495,7 @@ func (c *Client) WatchTWAPOrderEvents(ctx context.Context, eventChan chan<- Flow
 	return iter.Error()
 }
 
-
-func (c *Client) WatchIntervalExecutionEvents(ctx context.Context, eventChan chan<- FlowFusionEscrowFactoryTWAPIntervalExecuted) error {
+func (c *Client) WatchIntervalExecutionEvents(ctx context.Context, eventChan chan<- generated.FlowFusionEscrowFactoryTWAPIntervalExecuted) error {
 	c.logger.Info("Starting to watch TWAP interval execution events")
 
 	// Get current block number to start watching from
@@ -489,47 +505,31 @@ func (c *Client) WatchIntervalExecutionEvents(ctx context.Context, eventChan cha
 		currentBlock = 0
 	}
 
-	// Note: FilterTWAPIntervalExecuted method is missing from the generated bindings
-	// You'll need to either:
-	// 1. Regenerate the Go bindings with all events included
-	// 2. Use the generic event watching approach below
-	// 3. Manually add the missing filter method to your bindings
-
-	// Using generic event filtering approach:
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(currentBlock)),
-		ToBlock:   nil, 
-		Addresses: []common.Address{c.contractAddress},
-		Topics: [][]common.Hash{
-			{crypto.Keccak256Hash([]byte("TWAPIntervalExecuted(bytes32,uint256,uint256,bytes32)"))},
-		},
+	// Use the generated FilterTWAPIntervalExecuted method
+	filterOpts := &bind.FilterOpts{
+		Start:   currentBlock,
+		Context: ctx,
 	}
 
-	logs, err := c.ethClient.FilterLogs(ctx, query)
+	iter, err := c.contract.FilterTWAPIntervalExecuted(filterOpts, nil, nil)
 	if err != nil {
-		return fmt.Errorf("failed to filter logs: %w", err)
+		return fmt.Errorf("failed to create interval execution filter: %w", err)
 	}
+	defer iter.Close()
 
-	for _, vLog := range logs {
-		// Parse the log manually
-		event := FlowFusionEscrowFactoryTWAPIntervalExecuted{
-			OrderId:       [32]byte(vLog.Topics[1]),
-			IntervalIndex: new(big.Int).SetBytes(vLog.Topics[2][:]),
-			Raw:           vLog,
+	for iter.Next() {
+		if iter.Error() != nil {
+			c.logger.Error("Interval execution event iterator error", zap.Error(iter.Error()))
+			continue
 		}
 
-		// Parse non-indexed parameters from Data
-		if len(vLog.Data) >= 64 {
-			event.Amount = new(big.Int).SetBytes(vLog.Data[:32])
-			copy(event.SecretHash[:], vLog.Data[32:64])
-		}
-
+		event := *iter.Event
 		c.logger.Info("TWAP interval executed event",
 			zap.String("order_id", fmt.Sprintf("0x%x", event.OrderId)),
 			zap.String("interval_index", event.IntervalIndex.String()),
 			zap.String("amount", event.Amount.String()),
 			zap.String("secret_hash", fmt.Sprintf("0x%x", event.SecretHash)),
-			zap.Uint64("block_number", vLog.BlockNumber),
+			zap.Uint64("block_number", event.Raw.BlockNumber),
 		)
 
 		select {
@@ -539,10 +539,10 @@ func (c *Client) WatchIntervalExecutionEvents(ctx context.Context, eventChan cha
 		}
 	}
 
-	return nil
+	return iter.Error()
 }
 
-func (c *Client) WatchCosmosEscrowCreatedEvents(ctx context.Context, eventChan chan<- FlowFusionEscrowFactoryCosmosEscrowCreated) error {
+func (c *Client) WatchCosmosEscrowCreatedEvents(ctx context.Context, eventChan chan<- generated.FlowFusionEscrowFactoryCosmosEscrowCreated) error {
 	c.logger.Info("Starting to watch CosmosEscrowCreated events")
 
 	currentBlock, err := c.ethClient.BlockNumber(ctx)
@@ -584,42 +584,6 @@ func (c *Client) WatchCosmosEscrowCreatedEvents(ctx context.Context, eventChan c
 	return iter.Error()
 }
 
-func (c *Client) EstimateGas(ctx context.Context, msg ethereum.CallMsg) (uint64, error) {
-	return c.ethClient.EstimateGas(ctx, msg)
-}
-
-func (c *Client) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
-	return c.ethClient.SuggestGasPrice(ctx)
-}
-
-func (c *Client) SignTransaction(ctx context.Context, tx *types.Transaction) (*types.Transaction, error) {
-	signer := types.LatestSignerForChainID(c.chainID)
-	signedTx, err := types.SignTx(tx, signer, c.privateKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign transaction: %w", err)
-	}
-	return signedTx, nil
-}
-
-func (c *Client) SendTransaction(ctx context.Context, signedTx *types.Transaction) error {
-	err := c.ethClient.SendTransaction(ctx, signedTx)
-	if err != nil {
-		return fmt.Errorf("failed to send transaction: %w", err)
-	}
-	c.logger.Info("Transaction sent",
-		zap.String("tx_hash", signedTx.Hash().Hex()),
-	)
-	return nil
-}
-
-func (c *Client) GetTransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
-	receipt, err := c.ethClient.TransactionReceipt(ctx, txHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get transaction receipt: %w", err)
-	}
-	return receipt, nil
-}
-
 func (c *Client) CreateEscrow(ctx context.Context, params CreateEscrowParams) (common.Hash, error) {
 	if err := c.updateTransactOpts(ctx); err != nil {
 		return common.Hash{}, fmt.Errorf("failed to update transaction options: %w", err)
@@ -633,21 +597,15 @@ func (c *Client) CreateEscrow(ctx context.Context, params CreateEscrowParams) (c
 	}
 
 	// Create immutables struct for createSrcEscrow
-	immutables := IBaseEscrowImmutables{
-		Maker:    c.publicKey,
-		Taker:    recipient,
-		Token:    token,
-		Amount:   params.Amount,
-		HashLock: secretHash,
-		Timelocks: struct {
-			Prepayment *big.Int
-			Maturity   *big.Int
-			Expiration *big.Int
-		}{
-			Prepayment: big.NewInt(0),
-			Maturity:   big.NewInt(int64(params.TimeLimit)),
-			Expiration: big.NewInt(int64(params.TimeLimit + 3600)), // 1 hour buffer
-		},
+	immutables := generated.IBaseEscrowImmutables{
+		OrderHash:     [32]byte{}, // Generate or use provided order hash
+		Hashlock:      secretHash,
+		Maker:         addressToUint256(c.publicKey),
+		Taker:         addressToUint256(recipient),
+		Token:         addressToUint256(token),
+		Amount:        params.Amount,
+		SafetyDeposit: big.NewInt(0),
+		Timelocks:     timelocksToUint256(params.TimeLimit),
 	}
 
 	var tx *types.Transaction
@@ -694,14 +652,20 @@ func (c *Client) RevealSecret(ctx context.Context, escrowAddress common.Address,
 		return common.Hash{}, fmt.Errorf("invalid secret: %w", err)
 	}
 
-	escrow, err := NewIBaseEscrow(escrowAddress, c.ethClient)
+	escrow, err := generated.NewIBaseEscrow(escrowAddress, c.ethClient)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("failed to bind escrow contract: %w", err)
 	}
 
+	// Create immutables for the withdraw call
+	immutables := generated.IBaseEscrowImmutables{
+		// You would need to populate this with the actual immutables for this escrow
+		// This is a placeholder - in practice you'd get these from storage or events
+	}
+
 	var tx *types.Transaction
 	for i := 0; i < MaxRetries; i++ {
-		tx, err = escrow.RevealSecret(c.auth, secretBytes)
+		tx, err = escrow.Withdraw(c.auth, secretBytes, immutables)
 		if err == nil {
 			break
 		}
@@ -752,13 +716,7 @@ func (c *Client) updateTransactOpts(ctx context.Context) error {
 	return nil
 }
 
-// Helper function to convert string to bytes32
-func StringToBytes32(s string) [32]byte {
-	var bytes32 [32]byte
-	copy(bytes32[:], []byte(s))
-	return bytes32
-}
-
+// Helper functions
 func HexToBytes32(hex string) ([32]byte, error) {
 	var bytes32 [32]byte
 	
@@ -770,20 +728,22 @@ func HexToBytes32(hex string) ([32]byte, error) {
 		return bytes32, fmt.Errorf("invalid hex length: expected 64 characters for 32 bytes, got %d", len(hex))
 	}
 	
-	// Validate hex characters
-	for i, r := range hex {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return bytes32, fmt.Errorf("invalid hex character '%c' at position %d", r, i)
-		}
-	}
-	
-	// Convert hex to bytes
 	bytes := common.FromHex("0x" + hex)
-	
 	if len(bytes) != 32 {
 		return bytes32, fmt.Errorf("invalid hex conversion: expected 32 bytes, got %d", len(bytes))
 	}
 	
 	copy(bytes32[:], bytes)
 	return bytes32, nil
+}
+
+// Helper functions to convert between types as needed by the contracts
+func addressToUint256(addr common.Address) *big.Int {
+	return new(big.Int).SetBytes(addr.Bytes())
+}
+
+func timelocksToUint256(timeLimit uint64) *big.Int {
+	// This is a simplified conversion - you'd need to properly encode
+	// the timelocks struct according to your contract's expectations
+	return big.NewInt(int64(timeLimit))
 }
